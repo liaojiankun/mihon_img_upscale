@@ -804,7 +804,13 @@ class Downloader(
             for (candidate in pending) {
                 val (chapter, file, _, isDirectory, size, modified) = candidate
                 val remoteReason = remoteChecks.getValue(chapter.id)
-                val reason = if (cloudSyncTargetOrNull() != target) CloudStorageReleaseReason.TargetChanged else remoteReason
+                val reason = if (cloudSyncTargetOrNull() !=
+                    target
+                ) {
+                    CloudStorageReleaseReason.TargetChanged
+                } else {
+                    remoteReason
+                }
                 val finalReason = reason ?: try {
                     lock.withLock {
                         uploadLock.withLock {
@@ -909,8 +915,10 @@ class Downloader(
             }
             for ((id, reason) in lookupReleaseDirectory(storage, directory, checks)) {
                 if (reason != CloudStorageReleaseReason.RemoteMissing &&
-                    (reason != CloudStorageReleaseReason.RemoteMismatch ||
-                        results[id] != CloudStorageReleaseReason.RemoteUnavailable)
+                    (
+                        reason != CloudStorageReleaseReason.RemoteMismatch ||
+                            results[id] != CloudStorageReleaseReason.RemoteUnavailable
+                        )
                 ) {
                     results[id] = reason
                 }
@@ -945,7 +953,8 @@ class Downloader(
                         return@async id to CloudStorageReleaseReason.RemoteMissing
                     }
                     val size = try {
-                        listing?.get(check.name) ?: releaseLookup { storage.lookupRemoteFileSize(directory, check.name) }
+                        listing?.get(check.name)
+                            ?: releaseLookup { storage.lookupRemoteFileSize(directory, check.name) }
                     } catch (error: Exception) {
                         if (error is CancellationException) throw error
                         logcat(LogPriority.WARN, error) { "Could not verify cloud file for chapter $id" }
@@ -1799,8 +1808,10 @@ class Downloader(
         task.record.targetId == target && task.record.mangaId !in deletingRemoteMangas &&
             canTransfer(task.download) &&
             (!task.record.background || !downloadPreferences.cloudSyncAutomaticPaused().get()) &&
-            (!task.record.background || task.record.automatic || !libraryCloudSync.hasConfiguredScope() ||
-                libraryCloudSync.canTransfer(task.record.mangaId, task.record.targetId))
+            (
+                !task.record.background || task.record.automatic || !libraryCloudSync.hasConfiguredScope() ||
+                    libraryCloudSync.canTransfer(task.record.mangaId, task.record.targetId)
+                )
 
     internal suspend fun runCloudUploads(
         networkAllowed: () -> Boolean,
@@ -1973,7 +1984,9 @@ class Downloader(
     }
 
     private fun setCloudUploadsPaused(tasks: List<CloudUploadTask>, paused: Boolean) {
-        val records = tasks.map { it.record.copy(paused = paused, failed = false, retryAttempts = 0, retryAfterMillis = 0) }
+        val records = tasks.map {
+            it.record.copy(paused = paused, failed = false, retryAttempts = 0, retryAfterMillis = 0)
+        }
         store.saveUploads(records)
         tasks.zip(records).forEach { (task, record) -> task.updateRecord(record) }
     }

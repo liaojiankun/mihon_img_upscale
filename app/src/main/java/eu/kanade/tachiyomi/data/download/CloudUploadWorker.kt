@@ -153,7 +153,11 @@ class CloudUploadWorker(context: Context, parameters: WorkerParameters) : Corout
             enqueue(context, wifiOnly, policy)
         }
 
-        internal fun enqueue(context: Context, wifiOnly: Boolean, policy: ExistingWorkPolicy = ExistingWorkPolicy.KEEP) {
+        internal fun enqueue(
+            context: Context,
+            wifiOnly: Boolean,
+            policy: ExistingWorkPolicy = ExistingWorkPolicy.KEEP,
+        ) {
             if (!WorkManager.isInitialized()) return
             val request = OneTimeWorkRequestBuilder<CloudUploadWorker>()
                 .setInputData(workDataOf(WIFI_ONLY to wifiOnly))

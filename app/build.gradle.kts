@@ -180,9 +180,11 @@ android {
             .getOrElse("")
             .trim()
             .ifEmpty { "2a99b21a-48c3-4b19-b0ef-ea42da100884" }
-        require(runCatching {
-            UUID.fromString(oneDriveClientId).toString().equals(oneDriveClientId, ignoreCase = true)
-        }.getOrDefault(false)) { "oneDriveClientId must be a Microsoft Entra application (client) ID" }
+        require(
+            runCatching {
+                UUID.fromString(oneDriveClientId).toString().equals(oneDriveClientId, ignoreCase = true)
+            }.getOrDefault(false),
+        ) { "oneDriveClientId must be a Microsoft Entra application (client) ID" }
         buildConfigField("String", "ONEDRIVE_CLIENT_ID", "\"$oneDriveClientId\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

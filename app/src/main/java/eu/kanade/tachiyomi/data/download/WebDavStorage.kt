@@ -97,7 +97,11 @@ internal class WebDavStorage(
                         if (resolved.pathSegments.dropLastWhile(String::isEmpty) != url.pathSegments) continue
                         val status = resource.httpStatus()
                         if (status == 404 || status == 410) return null
-                        if (status != null && status !in 200..299) throw IOException("WebDAV PROPFIND failed: HTTP $status")
+                        if (status != null &&
+                            status !in 200..299
+                        ) {
+                            throw IOException("WebDAV PROPFIND failed: HTTP $status")
+                        }
                         check(resource.getElementsByTagNameNS(DAV_NAMESPACE, "collection").length == 0) {
                             "The WebDAV upload destination is a directory"
                         }

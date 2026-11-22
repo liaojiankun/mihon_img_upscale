@@ -263,7 +263,9 @@ class WebDavDownloadIntegrationTest {
                         check(finishCreation.await(10, java.util.concurrent.TimeUnit.SECONDS))
                         201
                     }
-                    else -> if (finishCreation.count == 0L) 201 else {
+                    else -> if (finishCreation.count == 0L) {
+                        201
+                    } else {
                         conflicts.incrementAndGet()
                         423
                     }
@@ -272,9 +274,11 @@ class WebDavDownloadIntegrationTest {
                 201
             }
         }
-        val chapter = async { graph.cloudSyncService.storage(config).uploadFile("/target/new", file, "chapter.cbz", false) {} }
+        val chapter =
+            async { graph.cloudSyncService.storage(config).uploadFile("/target/new", file, "chapter.cbz", false) {} }
         await { firstCreation.count == 0L }
-        val metadata = async { graph.cloudSyncService.storage(config).uploadFile("/target/new", file, "meta.info", false) {} }
+        val metadata =
+            async { graph.cloudSyncService.storage(config).uploadFile("/target/new", file, "meta.info", false) {} }
         try {
             withTimeoutOrNull(500) { metadata.join() }
         } finally {
@@ -1940,7 +1944,6 @@ private class DavTestServer : AutoCloseable {
     val conditionedPuts = AtomicInteger()
     val deletedCollections = java.util.concurrent.ConcurrentLinkedQueue<String>()
     val releaseLookups = java.util.concurrent.ConcurrentLinkedQueue<String>()
-
 
     @Volatile var failNextPut = false
 

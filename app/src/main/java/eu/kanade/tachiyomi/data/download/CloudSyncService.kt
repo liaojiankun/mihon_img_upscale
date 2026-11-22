@@ -40,6 +40,7 @@ class CloudSyncService(
 
 internal interface CloudStorage {
     suspend fun listDirectories(path: String): List<CloudSyncDirectory>
+
     /** Returns true if bytes were uploaded, or false if an existing file was kept. */
     suspend fun uploadFile(
         remoteDirectory: String,

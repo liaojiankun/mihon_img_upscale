@@ -102,7 +102,13 @@ class MoreViewModel(
             combine(
                 downloadManager.isDownloaderRunning,
                 downloadManager.queueState.flatMapLatest { queue ->
-                    if (queue.isEmpty()) flowOf(emptyList()) else combine(queue.map(Download::statusFlow)) { it.toList() }
+                    if (queue.isEmpty()) {
+                        flowOf(emptyList())
+                    } else {
+                        combine(queue.map(Download::statusFlow)) {
+                            it.toList()
+                        }
+                    }
                 },
             ) { isRunning, statuses ->
                 val failed = statuses.count { it == Download.State.ERROR }

@@ -34,8 +34,8 @@ import mihon.app.di.appGraph
 import tachiyomi.core.common.i18n.stringResource
 import tachiyomi.core.common.util.system.logcat
 import tachiyomi.i18n.MR
-import java.util.concurrent.TimeUnit
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 
 class CloudStorageReleaseWorker(context: Context, parameters: WorkerParameters) : CoroutineWorker(context, parameters) {
@@ -164,7 +164,10 @@ class CloudStorageReleaseWorker(context: Context, parameters: WorkerParameters) 
             val preferences = context.releaseResultPreferences
             val acknowledged = preferences.getStringSet("acknowledged", emptySet()).orEmpty()
             val availableIds = jobs.mapTo(HashSet()) { it.id.toString() }
-            preferences.edit().putStringSet("acknowledged", acknowledged.intersect(availableIds) + id.toString()).apply()
+            preferences.edit().putStringSet(
+                "acknowledged",
+                acknowledged.intersect(availableIds) + id.toString(),
+            ).apply()
             context.cancelNotification(completionNotificationId(id))
         }
 
