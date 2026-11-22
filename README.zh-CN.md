@@ -57,13 +57,15 @@
 | :--- | :--- |
 | **Vulkan GPU** | 支持下表中的完整模型列表，精度可选 FP16、FP32 或 BF16 |
 | **Qualcomm NPU** | 通过 QNN / HTP 运行 FP16 模型，当前打包运行时覆盖 HTP v69、v73、v75、v79、v81 |
-| **MediaTek NPU** | Android 12+ 的 ARM64 联发科设备，通过 LiteRT / NeuroPilot 运行 FP16 模型 |
+| **MediaTek NPU** | Android 12+ 的 ARM64 联发科设备，15 个模型经 LiteRT / NeuroPilot 全量委派，以 FP16 计算 |
 
 NPU 模型首次使用时在设备上准备，设置中会显示准备状态，并提供失败重试。准备后的模型缓存在应用私有目录，重启应用后可继续复用；清理增强图片缓存不会删除这些模型缓存。
 
 NPU 选项只提供兼容的模型和倍数，当前不打包 INT8 / W8A16 模型。选择 NPU 后不会自动切换到 CPU 或 Vulkan；需要 GPU 处理时请手动选择 Vulkan。
 
-联发科 NPU 路径尚未在对应硬件上完成实测，实际可用性取决于设备和系统驱动。Qualcomm 的架构支持也不代表所有设备、固件和模型组合均已验证。
+15 个联发科模型现已全部改用编译器允许表内的算子导出，因此每个变体都具备全量 NPU 委派的条件；此前版本含 `MIRROR_PAD`、`GATHER`、`DEPTH_TO_SPACE`，导致委派被迫退回 host。不提供 INT8：实测量化会使这些图损失 24–32 dB PSNR，因此 FP16 是联发科唯一可选精度。详见 [联发科 NPU 构建与兼容性说明](docs/mediatek-npu.md#precision)。
+
+联发科 NPU 路径已在天玑 9400+ 真机上跑通，所有图均为全量委派；实际可用性仍取决于设备、固件与系统驱动。该批真机上暴露的三个画质问题（拼接横纹、W2xEX 在 ncnn 资产不可达时跳过 NPU、SPAN 输入尺度不匹配导致黑片）已修复，详见 [推理正确性](docs/mediatek-npu.md#inference-correctness)。Qualcomm 的架构支持也不代表所有设备、固件和模型组合均已验证。
 
 ### 增强模型
 
@@ -84,7 +86,7 @@ NPU 选项只提供兼容的模型和倍数，当前不打包 INT8 / W8A16 模�
 
 ### NPU 模型范围
 
-Qualcomm 和 MediaTek 后端均使用以下 15 个 FP16 模型变体：
+Qualcomm 和 MediaTek 后端均使用以下 15 个模型变体。Qualcomm 侧为 FP16 QNN DLC；MediaTek 侧为 float32 常量权重的 TFLite，在 NPU 上以 FP16 计算：
 
 | 模型 | 倍数 | 变体 |
 | :--- | :---: | :--- |
@@ -114,7 +116,7 @@ Qualcomm 和 MediaTek 后端均使用以下 15 个 FP16 模型变体：
 NPU 模型需要额外准备，模型二进制和本机 SDK 配置不提交到 Git：
 
 - **Qualcomm**：配置匹配的 QAIRT SDK 和 15 个 FP16 DLC；在设备上生成并缓存 context，详见 [QNN 模型流程](tools/qnn/README.md)。
-- **MediaTek**：导出并配置 15 个 FP16 TFLite 模型，详见 [联发科 NPU 构建与兼容性说明](docs/mediatek-npu.md)。
+- **MediaTek**：15 个 TFLite 模型已提交在 `mediatek-models/`，导出为 float32 常量权重（FP16 权重会被联发科编译器拒绝），详见 [联发科 NPU 构建与兼容性说明](docs/mediatek-npu.md)。
 - **对比工具**：[NPU context 准备与推理基准](tools/npu-context-benchmark/README.md)。
 
 ## 致谢与许可证

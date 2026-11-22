@@ -45,13 +45,15 @@ Enable **Image enhancement** in the reader settings, then select a processing ba
 | :--- | :--- |
 | **Vulkan GPU** | Supports the full model list below, with FP16, FP32, or BF16 precision |
 | **Qualcomm NPU** | Runs FP16 models through QNN / HTP; the packaged runtime covers HTP v69, v73, v75, v79, and v81 |
-| **MediaTek NPU** | Runs FP16 models through LiteRT / NeuroPilot on ARM64 MediaTek devices with Android 12 or newer |
+| **MediaTek NPU** | Runs the 15 models fully delegated through LiteRT / NeuroPilot, computing in FP16, on ARM64 MediaTek devices with Android 12 or newer |
 
 NPU models are prepared on the device on first use. Settings show preparation progress and offer a retry after failure. Prepared models persist in app-private storage across app restarts; clearing the enhanced-image cache does not remove them.
 
 NPU mode offers compatible models and scales only. INT8 / W8A16 models are no longer packaged. Selecting an NPU backend does not automatically switch to CPU or Vulkan on failure; select Vulkan explicitly to use the GPU.
 
-The MediaTek path has not yet been tested on MediaTek hardware; availability depends on the device and its system drivers. Qualcomm architecture coverage also does not imply that every device, firmware, and model combination has been verified.
+All 15 MediaTek models are now exported using only operators on MediaTek's compiler allow-list, so full NPU delegation is possible for every variant; earlier builds contained `MIRROR_PAD`, `GATHER` and `DEPTH_TO_SPACE`, which forced delegation to fall back to the host. INT8 is not offered: measured post-training quantization of these graphs costs 24–32 dB PSNR, so FP16 remains the only selectable MediaTek precision. See [MediaTek build and compatibility details](docs/mediatek-npu.md#precision).
+
+The MediaTek path runs on Dimensity 9400+ hardware with every graph fully delegated to the NPU; availability still depends on the device, its firmware and its system drivers. Three image-correctness defects found on that hardware (tile-seam banding, W2xEX pages skipping the NPU when the ncnn assets were unreachable, and a SPAN input-scale mismatch that produced black pages) are fixed; see [Inference correctness](docs/mediatek-npu.md#inference-correctness). Qualcomm architecture coverage does not imply that every device, firmware, and model combination has been verified.
 
 ### Enhancement models
 
@@ -72,7 +74,7 @@ The following table describes Vulkan support. NPU support is listed separately b
 
 ### NPU models
 
-Both Qualcomm and MediaTek backends use these 15 FP16 model variants:
+Both Qualcomm and MediaTek backends use the same 15 model variants. Qualcomm ships them as FP16 QNN DLC; MediaTek ships them as TFLite with float32 constant weights and computes in FP16 on the NPU:
 
 | Model | Scale | Variants |
 | :--- | :---: | :--- |
@@ -102,7 +104,7 @@ Use the Gradle Wrapper and configure your Android SDK in the ignored `local.prop
 NPU builds require additional model preparation. Model binaries and local SDK configuration are not committed to Git:
 
 - **Qualcomm:** configure the matching QAIRT SDK and 15 FP16 DLCs. Contexts are compiled and cached on the device. See the [QNN model pipeline](tools/qnn/README.md).
-- **MediaTek:** export and configure 15 FP16 TFLite models. See [MediaTek build and compatibility details](docs/mediatek-npu.md).
+- **MediaTek:** the 15 TFLite models are committed under `mediatek-models/` and exported with float32 constant weights (FP16 weights make MediaTek's compiler reject the conv ops). See [MediaTek build and compatibility details](docs/mediatek-npu.md).
 - **Comparison tools:** [NPU context preparation and inference benchmark](tools/npu-context-benchmark/README.md).
 
 ## Credits and license

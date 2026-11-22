@@ -40,6 +40,35 @@ class MediaTekNpuDeviceTest {
         }
     }
 
+    /**
+     * The W2xEX NPU page must not go through the ncnn asset extraction. Before the
+     * fix that extraction ran first and its Hugging Face timeout aborted the whole
+     * call, so an offline page fell back to the original image even though the NPU
+     * model was already prepared (mihon_crash_logs(1).txt:11223).
+     */
+    @Test
+    fun w2xExNpuPageSkipsAssetExtraction() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val input = Bitmap.createBitmap(16, 24, Bitmap.Config.ARGB_8888)
+        try {
+            val start = System.nanoTime()
+            val initialized = Waifu2x.initW2xEx(
+                context,
+                Waifu2x.MODEL_W2XEX_PHOTO_SMALL,
+                processingBackend = 2,
+            )
+            val elapsedMs = (System.nanoTime() - start) / 1_000_000
+            // No MediaTek NPU here, so the page cannot be enhanced — but it must fail
+            // locally, not after the 15 s per-file download timeout.
+            assertFalse(initialized)
+            assertTrue("NPU init waited ${elapsedMs}ms, asset download was attempted", elapsedMs < 5_000)
+            assertNull("Failed NPU page must not run any other backend", Waifu2x.processW2xEx(input))
+        } finally {
+            input.recycle()
+            Waifu2x.resetRealCugan()
+        }
+    }
+
     @Test
     fun failedQnnLoadDoesNotRunAnAvailableVulkanModel() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext

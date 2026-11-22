@@ -142,7 +142,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeSetProcessingBackend(
 extern "C" JNIEXPORT jstring JNICALL
 Java_eu_kanade_tachiyomi_util_mediatek_MediaTekNpu_nativeInitialize(
     JNIEnv *env, jobject, jstring model, jstring cache, jstring libraries,
-    jint scale, jint padding, jboolean cpu_test, jboolean prepare_only) {
+    jint scale, jint padding, jboolean cpu_test) {
   std::lock_guard<std::mutex> lock(g_lock);
 #ifdef NDEBUG
   if (cpu_test) return env->NewStringUTF("CPU validation is unavailable in release builds");
@@ -150,15 +150,12 @@ Java_eu_kanade_tachiyomi_util_mediatek_MediaTekNpu_nativeInitialize(
   const char *m = env->GetStringUTFChars(model, nullptr);
   const char *c = env->GetStringUTFChars(cache, nullptr);
   const char *l = env->GetStringUTFChars(libraries, nullptr);
-  std::string error;
-  if (prepare_only) {
-    // Vendor dispatch libraries may keep global environment state. Release an
-    // old model before preparing another; the next reader initialization reloads it.
-    litert_backend::shutdown();
-    error = litert_backend::prepare(m, c, l, scale, padding);
-  }
-  else if (!litert_backend::initialize(m, c, l, scale, padding, cpu_test))
-    error = litert_backend::last_error();
+  // One compilation per model per process. The previous signature also took a
+  // `prepare_only` flag that compiled into a throwaway Runtime first, which
+  // doubled the Neuron compile (analysis/timing.md §B3).
+  const std::string error = litert_backend::initialize(m, c, l, scale, padding, cpu_test)
+                                ? std::string()
+                                : litert_backend::last_error();
   env->ReleaseStringUTFChars(model, m);
   env->ReleaseStringUTFChars(cache, c);
   env->ReleaseStringUTFChars(libraries, l);
@@ -853,6 +850,47 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitW2xEx(
   env->ReleaseStringUTFChars(model_stem, model_stem_str);
   env->ReleaseStringUTFChars(model_dir, model_dir_str);
   return ret == 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+// Geometry-only init for the NPU backends: LiteRT keeps its own compiled model,
+// so this only establishes the page geometry (scale, tile padding) and the
+// g_waifu2x instance nativeProcess needs. It deliberately skips the ncnn asset
+// extraction and model load, which is what made an offline W2xEX page fall back
+// to the original image even though the NPU model was already prepared.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitBackendOnly(
+    JNIEnv *, jobject, jint scale, jint padding, jboolean realcugan_pro) {
+  g_abort_processing = true;
+  std::lock_guard<std::mutex> lock(g_lock);
+  g_abort_processing = false;
+  // The texture guard is a Real-CUGAN Pro concern; every other family and
+  // backend keeps it off. The caller is the one that knows which model this
+  // page is, so it passes the flag in instead of it being inferred here.
+  g_realcugan_pro = realcugan_pro == JNI_TRUE;
+
+  qnn_backend::shutdown();
+  litert_backend::shutdown();
+  g_requested_backend = 0;
+
+  if (g_waifu2x) {
+    delete g_waifu2x;
+  }
+
+  // gpuid -1: this instance carries only the page geometry for nativeProcess,
+  // which dispatches straight to LiteRT, so it must not acquire a Vulkan device.
+  g_waifu2x = new Waifu2x(-1, false, 0, 0, false);
+  g_waifu2x->disable_grayscale_check = true;
+  g_waifu2x->noise = 0;
+  g_waifu2x->scale = scale;
+  g_waifu2x->prepadding = std::clamp(static_cast<int>(padding), 0, 48);
+  g_waifu2x->progress_ptr = &g_progress;
+  g_waifu2x->ui_busy_ptr = &g_ui_busy;
+  g_waifu2x->should_abort_ptr = &g_abort_processing;
+  g_progress.store(0);
+
+  LOGD("Backend-only geometry init: scale=%d padding=%d pro=%d", scale,
+       g_waifu2x->prepadding, realcugan_pro == JNI_TRUE ? 1 : 0);
+  return JNI_TRUE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

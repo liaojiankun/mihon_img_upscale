@@ -180,7 +180,13 @@ internal fun ColumnScope.ColorFilterPage(viewModel: ReaderSettingsViewModel) {
         val mediaTekPreparationStates by MediaTekNpu.states.collectAsState()
         val preparationStates = if (useMediaTekNpu) mediaTekPreparationStates else qnnPreparationStates
         val preparationKey = qnnModelName?.let {
-            if (useQualcommNpu) QnnModelContexts.stateKey(it, precision) else it
+            when {
+                useQualcommNpu -> QnnModelContexts.stateKey(it, precision)
+                // MediaTek keys by model name only, because its Failed state is what surfaces
+                // "此模型的 NPU 准备失败". A precision change re-runs preparation through the
+                // LaunchedEffect(processingBackend, qnnModelName, precision, ...) below.
+                else -> it
+            }
         }
         var preparationRetry by remember { mutableStateOf(0) }
         LaunchedEffect(processingBackend, qnnModelName, precision, preparationRetry) {
@@ -449,7 +455,8 @@ internal fun ColumnScope.ColorFilterPage(viewModel: ReaderSettingsViewModel) {
 
         val supportedPrecisions = when {
             useQualcommNpu -> QnnModelContexts.supportedPrecisions(qnnModelName)
-            useMediaTekNpu -> listOf(0)
+            // See MediaTekNpu.supportedPrecisions() for why only FP16 is listable today.
+            useMediaTekNpu -> MediaTekNpu.supportedPrecisions()
             else -> listOf(0, 1, 3)
         }
         LaunchedEffect(processingBackend, qnnModelName, precision) {

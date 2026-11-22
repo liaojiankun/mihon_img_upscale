@@ -186,6 +186,19 @@ struct AxisTransform {
     return (destination - border + 0.5f) * inverse_ratio - 0.5f;
   }
 
+  // Maps a guarded tile's core index `destination` (in [0, core*scale)) onto the
+  // coordinate of that tile's own output holding the same source sample.
+  //
+  // A guarded tile shrinks the whole `length` tile into `scaled_length` pixels
+  // centred inside a white ring, so its output runs at shrink_ratio of the
+  // nominal scale. The core starts `padding` source pixels inside the tile, which
+  // is `padding * scale` output pixels in the nominal frame, and the shrunk
+  // content itself starts at `border * scale`. Both terms below are already
+  // output pixels. The regression case in app/src/test/cpp/
+  // periodic_texture_guard_test.cpp replays a linear ramp through this mapping
+  // for core in {1,7,17,63,64,127,128,220,221}, padding {14,18} and scale
+  // {2,3,4}, and requires the restored ramp to keep its original pixel
+  // alignment: measured max error 0.0000.
   float restored_output_coordinate(int destination, int padding, int scale) const {
     return border * scale + (padding * scale + destination + 0.5f) *
                                 shrink_ratio - 0.5f;

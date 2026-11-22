@@ -168,18 +168,49 @@ object Waifu2x {
                     context,
                     resolvedBackend,
                     qnnModelName(model, scale, effectiveNoiseLevel),
-                    if (scale ==
-                        3
-                    ) {
-                        14
-                    } else {
-                        18
-                    },
+                    realCuganPadding(scale),
                     resolvedPrecision,
                 )
             }
 
             val assetPath = if (isPro) "realcugan-pro-models" else "realcugan-models"
+            // An NPU page runs entirely on the NPU model: LiteRT holds its own
+            // compiled graph, and the only thing nativeProcess needs is the page
+            // geometry. Loading the ncnn model here built a full Vulkan pipeline
+            // (gpu instance, shaders, .param/.bin) that this page never uses —
+            // measured at 1.46-1.88 s per cold page, 85.8-96.7 % of the whole
+            // pre-inference segment (logs/116, analysis/timing.md §B4). It also
+            // overwrote g_realcugan_pro, silently disabling the Real-CUGAN Pro
+            // texture guard and letting the tile-seam fix miss that model.
+            if (resolvedBackend != PROCESSING_BACKEND_VULKAN) {
+                if (!initBackendOnly(
+                        context,
+                        resolvedBackend,
+                        qnnModelName(model, scale, effectiveNoiseLevel),
+                        realCuganPadding(scale),
+                        scale,
+                        resolvedPrecision,
+                        realcuganPro = isPro,
+                    )
+                ) {
+                    return false
+                }
+                lastRealCuganConfig = currentConfig
+                isRealCuganInitialized = true
+                isInitialized = false
+                isRealEsrganInitialized = false
+                isNoseInitialized = false
+                isWaifu2xInitialized = false
+                isAnime4kInitialized = false
+                isW2xExInitialized = false
+                android.util.Log.d(
+                    "Waifu2x",
+                    "Initialized Real-CUGAN: isPro=$isPro, noise=$effectiveNoiseLevel, scale=$scale, " +
+                        "tileSleepMs=$tileSleepMs, tileSize=$tileSize, precision=${currentConfig.precision}, " +
+                        "backend=${backendName(currentConfig.processingBackend)}",
+                )
+                return isRealCuganInitialized
+            }
             val modelDir = extractModelsToCache(context, assetPath)
             if (modelDir == null) {
                 return false
@@ -218,13 +249,7 @@ object Waifu2x {
                     context,
                     resolvedBackend,
                     qnnModelName(model, scale, effectiveNoiseLevel),
-                    if (scale ==
-                        3
-                    ) {
-                        14
-                    } else {
-                        18
-                    },
+                    realCuganPadding(scale),
                     resolvedPrecision,
                 )
         }
@@ -280,6 +305,37 @@ object Waifu2x {
             "realesrgan-models/v3-general"
         } else {
             "realesrgan-models/v3-anime"
+        }
+        // Same reasoning as initRealCugan: an NPU page never touches ncnn, so
+        // building its Vulkan pipeline is pure per-page latency.
+        if (resolvedBackend != PROCESSING_BACKEND_VULKAN) {
+            if (!initBackendOnly(
+                    context,
+                    resolvedBackend,
+                    qnnModelName(MODEL_REAL_ESRGAN_ANIME, outputScale, 0, style),
+                    if (isPhotoStyle) 32 else 16,
+                    outputScale,
+                    resolvedPrecision,
+                )
+            ) {
+                return false
+            }
+            lastRealEsrganConfig = config
+            isRealEsrganInitialized = true
+            isInitialized = false
+            isRealCuganInitialized = false
+            isNoseInitialized = false
+            isWaifu2xInitialized = false
+            isAnime4kInitialized = false
+            isW2xExInitialized = false
+            android.util.Log.d(
+                "Waifu2x",
+                "Initialized Real-ESRGAN animevideov3: outputScale=$outputScale, tileSleepMs=$tileSleepMs, " +
+                    "tileSize=$tileSize, precision=${config.precision}, backend=${backendName(
+                        config.processingBackend,
+                    )}",
+            )
+            return isRealEsrganInitialized
         }
         val modelDir = extractModelsToCache(context, assetPath)
         if (modelDir == null) {
@@ -498,6 +554,47 @@ object Waifu2x {
 
     fun isW2xExModel(model: Int): Boolean = w2xExModelFor(model) != null
 
+    /**
+     * Initialise a page for one of the NPU backends without loading an ncnn model.
+     *
+     * The NPU paths execute through [eu.kanade.tachiyomi.util.mediatek.MediaTekNpu] /
+     * QNN, which hold their own compiled model, so the only thing native needs here
+     * is the page geometry (scale, tile padding) and the `g_waifu2x` instance that
+     * `nativeProcess` writes into. This keeps a missing or undownloadable ncnn model
+     * from failing an NPU page.
+     */
+    private fun initBackendOnly(
+        context: Context,
+        backend: Int,
+        modelName: String?,
+        padding: Int,
+        scale: Int,
+        precision: Int,
+        realcuganPro: Boolean = false,
+    ): Boolean {
+        val resolved = if (backend == PROCESSING_BACKEND_QUALCOMM_NPU) precision else 0
+        if (!nativeInitBackendOnly(scale, padding, realcuganPro)) return false
+        isInitialized = false
+        isRealCuganInitialized = false
+        isRealEsrganInitialized = false
+        isNoseInitialized = false
+        isWaifu2xInitialized = false
+        isAnime4kInitialized = false
+        isW2xExInitialized = false
+        // Only claim the page once the NPU backend actually accepted the model, so a
+        // failed backend leaves every process* entry point returning null (original
+        // image) instead of running an uninitialised native instance.
+        if (!initializeBackend(context, backend, modelName, padding, resolved)) return false
+        lastW2xExConfig = W2xExConfig(-1, scale, resolved, false, backend)
+        isW2xExInitialized = true
+        android.util.Log.d(
+            "Waifu2x",
+            "Backend-only init: model=$modelName, scale=$scale, padding=$padding, " +
+                "backend=${backendName(backend)}",
+        )
+        return true
+    }
+
     fun initW2xEx(
         context: Context,
         model: Int,
@@ -510,10 +607,24 @@ object Waifu2x {
     ): Boolean = synchronized(this) {
         val selectedModel = w2xExModelFor(model) ?: return false
         val effectiveScale = selectedModel.scale
-        val modelDir = extractModelsToCache(context, selectedModel.assetPath) ?: return false
         val modelStem = selectedModel.stem
+        // Resolve the backend before touching the ncnn assets. The NPU keeps its
+        // own compiled model, so it neither needs the .param/.bin files nor may
+        // be aborted by their download: that timeout is what made an offline
+        // W2xEX page fall back to the original image (mihon_crash_logs(1).txt:11223).
         val resolvedBackend = resolveProcessingBackend(processingBackend, model, effectiveScale)
         val resolvedPrecision = resolvePrecision(precision, resolvedBackend, model, effectiveScale)
+        if (resolvedBackend != PROCESSING_BACKEND_VULKAN) {
+            return initBackendOnly(
+                context,
+                resolvedBackend,
+                qnnModelName(model, effectiveScale, 0),
+                selectedModel.padding,
+                effectiveScale,
+                resolvedPrecision,
+            )
+        }
+        val modelDir = extractModelsToCache(context, selectedModel.assetPath) ?: return false
 
         val config = W2xExConfig(model, effectiveScale, resolvedPrecision, fp16Arithmetic, resolvedBackend)
         if (lastW2xExConfig != config) {
@@ -1032,6 +1143,29 @@ object Waifu2x {
         return requestedPrecision.takeIf { it == 0 || it == 1 || it == 3 } ?: 0
     }
 
+    /**
+     * Tile overlap for Real-CUGAN, shared by the ncnn path and the NPU
+     * geometry-only init so the two can never diverge.
+     *
+     * 2x uses 20, not 18. Every tile is 256 px wide with core = 256 - 2*padding,
+     * so padding decides which source rows land on the tile's first and last
+     * output rows. Measured by replaying float_tiles exactly against the real
+     * model on a 1058x1500 page (tmp/r3_padtest.py, realcugan-se-x2-no-denoise,
+     * hard-copy stitching):
+     *
+     *     pad 16 -> max seam step 0.0011
+     *     pad 18 -> max seam step 0.2222   <- one near-black row every 440
+     *     pad 20 -> max seam step 0.0014
+     *     pad 24 -> max seam step 0.0018
+     *
+     * On device the same 18 produced dark rows at phase 42 mod 440 in 5 of 7
+     * tile seams of `realcugan-se-x2-no-denoise`, while Real-ESRGAN (16),
+     * W2xEX (10) and SPAN (24) had 0 of 7. Only 18 resonates with the model;
+     * 16/20/24 are all clean, so this is not "more padding is better".
+     * 20 costs 216/220 = 1.8 % more tiles than 18.
+     */
+    private fun realCuganPadding(scale: Int): Int = if (scale == 3) 14 else 20
+
     private fun ncnnPrecision(precision: Int): Int = if (precision == QnnModelContexts.PRECISION_W8A8) 0 else precision
 
     private fun backendName(backend: Int): String = when (backend) {
@@ -1120,6 +1254,7 @@ object Waifu2x {
         padding: Int,
     ): Boolean
     private external fun nativeProcess(input: Bitmap, id: Int): Bitmap?
+    private external fun nativeInitBackendOnly(scale: Int, padding: Int, realcuganPro: Boolean): Boolean
     private external fun nativeDestroy()
     private external fun nativeAbortProcessing()
     private external fun nativeClearAbortProcessing()

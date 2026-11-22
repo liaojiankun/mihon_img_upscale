@@ -80,6 +80,15 @@ set(WAIFU2X_SOURCES
 add_library(waifu2x-jni SHARED ${WAIFU2X_SOURCES})
 add_dependencies(waifu2x-jni waifu2x-fused-shaders)
 
+# The debug variant inherits no -O flag at all (clang then defaults to -O0), which
+# left the per-tile host post-processing — the output conversion in
+# litert_backend.cpp and the tile stitch in float_tile_processor.h — at ~10x the
+# optimized cost (measured on mt6991: 56 ms/tile of host post vs 38 ms/tile of
+# NPU execute). The tile pipeline is the hot path in every variant, so build it
+# optimized regardless of the Gradle build type. Issued after add_library so the
+# flag follows AGP's per-config flags on the command line and wins for debug.
+target_compile_options(waifu2x-jni PRIVATE -O2)
+
 # Include directories
 target_include_directories(waifu2x-jni PRIVATE
     ${CMAKE_SOURCE_DIR}

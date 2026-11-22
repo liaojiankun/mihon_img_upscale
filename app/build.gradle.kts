@@ -115,9 +115,13 @@ val stageQnnModels = qnnDlcRoot?.let { dlcRoot ->
         }
     }
 }
+// The FP16 LiteRT models ship in the repo (mediatek-models/) so that
+// MediaTekNpu.prepare() always finds assets/litert-models/manifest.json in a
+// plain checkout; a property or environment override still takes precedence.
 val mediaTekTfliteDir = providers.gradleProperty("mediatekTfliteDir").orNull
     ?: localProperties.getProperty("mediatek.tflite.dir")
     ?: System.getenv("MEDIATEK_TFLITE_DIR")
+    ?: "mediatek-models"
 val generatedMediaTekAssetsDir = layout.buildDirectory.dir("generated/mediatekAssets")
 val stageMediaTekModels = mediaTekTfliteDir?.takeIf { it.isNotBlank() }?.let { path ->
     val root = layout.settingsDirectory.file(path).asFile

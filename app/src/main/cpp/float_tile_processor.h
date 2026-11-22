@@ -67,23 +67,77 @@ int process(const uint8_t *input, int width, int height, int input_stride,
       };
       const int cw = std::min(core, width - tx) * scale;
       const int ch = std::min(core, height - ty) * scale;
+      // Value this tile predicts for output coordinate (x, y) of its own tile,
+      // i.e. exactly what the hard copy below writes. `x`/`y` are core-local.
+      auto value_at = [&](int x, int y, int c) {
+        if (!guarded) return sample(padding * scale + x, padding * scale + y, c);
+        float sx = guard.restored_output_coordinate(x, padding, scale);
+        float sy = guard.restored_output_coordinate(y, padding, scale);
+        int x0 = std::clamp(static_cast<int>(std::floor(sx)), 0, output_tile - 1);
+        int y0 = std::clamp(static_cast<int>(std::floor(sy)), 0, output_tile - 1);
+        int x1 = std::min(x0 + 1, output_tile - 1), y1 = std::min(y0 + 1, output_tile - 1);
+        float fx = sx - std::floor(sx), fy = sy - std::floor(sy);
+        return (sample(x0, y0, c) * (1 - fx) + sample(x1, y0, c) * fx) * (1 - fy) +
+               (sample(x0, y1, c) * (1 - fx) + sample(x1, y1, c) * fx) * fy;
+      };
+      // Feather into the already written neighbour before the hard copy. The
+      // padding band is this tile's prediction of the rows/columns that belong to
+      // the neighbour, so ramping through it removes the discontinuity where two
+      // tiles meet.
+      //
+      // Band row i sits at ABSOLUTE output row ty*scale - feather + i, i.e. source
+      // row ty - padding + i/scale. value_at(x, y) returns the prediction for
+      // source row ty + y/scale (its unguarded form samples model row
+      // padding*scale + y, and model row r is source row ty - padding + r/scale).
+      // Equating the two gives y = i - padding*scale = i - feather.
+      //
+      // Verified empirically on the real model, not just algebraically: for each
+      // band row compare this tile's prediction against the row the tile above
+      // already wrote (tmp/r3_band_proof.py, realcugan-se-x2-no-denoise,
+      // page-001, padding 18):
+      //     mean |diff| with y = i - feather : 0.0039 .. 0.0178
+      //     mean |diff| with y = i           : 0.0430 .. 0.0842   (5-15x worse)
+      // Passing i straight through makes the band paint content from `padding`
+      // source rows too late, which is the one-row seam line on every tile edge.
+      const int feather = std::min({padding * scale, cw, ch});
+      const bool feather_up = feather > 1 && ty > 0 && !plan.guards(tx, ty - core);
+      const bool feather_left = feather > 1 && tx > 0 && !plan.guards(tx - core, ty);
+      const int band_core_offset = -feather;
+      if (feather > 1) {
+        for (int i = 0; i < feather; ++i) {
+          const float alpha = static_cast<float>(i) / (feather - 1);
+          const int band_core = i + band_core_offset;
+          if (feather_up) {
+            uint8_t *band = output +
+                            static_cast<size_t>(ty * scale - feather + i) * output_stride;
+            for (int x = 0; x < cw; ++x) {
+              for (int c = 0; c < 3; ++c) {
+                const float current = band[(tx * scale + x) * 4 + c] / 255.0f;
+                const float blended = current * (1.0f - alpha) + value_at(x, band_core, c) * alpha;
+                band[(tx * scale + x) * 4 + c] =
+                    static_cast<uint8_t>(std::clamp(blended, 0.0f, 1.0f) * 255 + 0.5f);
+              }
+            }
+          }
+          if (feather_left) {
+            const int column = tx * scale - feather + i;
+            for (int y = 0; y < ch; ++y) {
+              uint8_t *row = output + static_cast<size_t>(ty * scale + y) * output_stride;
+              for (int c = 0; c < 3; ++c) {
+                const float current = row[column * 4 + c] / 255.0f;
+                const float blended = current * (1.0f - alpha) + value_at(band_core, y, c) * alpha;
+                row[column * 4 + c] =
+                    static_cast<uint8_t>(std::clamp(blended, 0.0f, 1.0f) * 255 + 0.5f);
+              }
+            }
+          }
+        }
+      }
       for (int y = 0; y < ch; ++y) {
         uint8_t *row = output + static_cast<size_t>(ty * scale + y) * output_stride + tx * scale * 4;
         for (int x = 0; x < cw; ++x) {
           for (int c = 0; c < 3; ++c) {
-            float v;
-            if (!guarded) v = sample(padding * scale + x, padding * scale + y, c);
-            else {
-              float sx = guard.restored_output_coordinate(x, padding, scale);
-              float sy = guard.restored_output_coordinate(y, padding, scale);
-              int x0 = std::clamp(static_cast<int>(std::floor(sx)), 0, output_tile - 1);
-              int y0 = std::clamp(static_cast<int>(std::floor(sy)), 0, output_tile - 1);
-              int x1 = std::min(x0+1, output_tile-1), y1 = std::min(y0+1, output_tile-1);
-              float fx = sx - std::floor(sx), fy = sy - std::floor(sy);
-              v = (sample(x0,y0,c)*(1-fx) + sample(x1,y0,c)*fx)*(1-fy) +
-                  (sample(x0,y1,c)*(1-fx) + sample(x1,y1,c)*fx)*fy;
-            }
-            row[x*4+c] = static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255 + 0.5f);
+            row[x*4+c] = static_cast<uint8_t>(std::clamp(value_at(x, y, c), 0.0f, 1.0f) * 255 + 0.5f);
           }
           row[x*4+3] = input[static_cast<size_t>(std::min(height-1, ty+y/scale)) * input_stride +
                                 std::min(width-1, tx+x/scale) * 4 + 3];

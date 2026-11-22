@@ -128,7 +128,10 @@ class LibraryUpdateWorker(private val context: Context, workerParams: WorkerPara
         libraryPreferences.lastUpdatedTimestamp.set(Clock.System.now().toEpochMilliseconds())
 
         val categoryId = inputData.getLong(KEY_CATEGORY, -1L)
-        addMangaToQueue(categoryId)
+        // The smart-update filters live in `autoUpdateMangaRestrictions` and exist to keep the
+        // *scheduled* refresh cheap. A refresh the user explicitly asked for must cover the whole
+        // selected category, otherwise the library silently refreshes only part of its entries.
+        addMangaToQueue(categoryId, isManualRefresh = tags.contains(WORK_NAME_MANUAL))
 
         return withContext(Dispatchers.IO) {
             try {
@@ -164,8 +167,11 @@ class LibraryUpdateWorker(private val context: Context, workerParams: WorkerPara
      * Adds list of manga to be updated.
      *
      * @param categoryId the ID of the category to update, or -1 if no category specified.
+     * @param isManualRefresh whether this run was requested by the user rather than by the
+     *   scheduled worker. A manual refresh covers the whole selection and does not apply
+     *   [shouldApplyAutoRestrictions]; see there for the reported symptom this fixes.
      */
-    private suspend fun addMangaToQueue(categoryId: Long) {
+    private suspend fun addMangaToQueue(categoryId: Long, isManualRefresh: Boolean = false) {
         val libraryManga = getLibraryManga.await()
 
         val listToUpdate = if (categoryId != -1L) {
@@ -181,7 +187,11 @@ class LibraryUpdateWorker(private val context: Context, workerParams: WorkerPara
             }
         }
 
-        val restrictions = libraryPreferences.autoUpdateMangaRestrictions.get()
+        val restrictions = if (shouldApplyAutoRestrictions(isManualRefresh)) {
+            libraryPreferences.autoUpdateMangaRestrictions.get()
+        } else {
+            emptySet()
+        }
         val skippedUpdates = mutableListOf<Pair<Manga, String?>>()
         val timeZone = TimeZone.currentSystemDefault()
         val fetchWindowUpperBound = fetchInterval.getWindow(
@@ -430,6 +440,17 @@ class LibraryUpdateWorker(private val context: Context, workerParams: WorkerPara
         private const val TAG = "LibraryUpdate"
         private const val WORK_NAME_AUTO = "LibraryUpdate-auto"
         private const val WORK_NAME_MANUAL = "LibraryUpdate-manual"
+
+        /**
+         * Whether a run should apply `autoUpdateMangaRestrictions`.
+         *
+         * Those preferences are named after *automatic* updates and exist to keep the scheduled
+         * refresh cheap; their defaults skip completed entries, entries with unread chapters,
+         * entries the user never opened, and entries whose estimated next release is more than the
+         * grace period away. A refresh the user explicitly asked for must therefore not apply them,
+         * otherwise the library appears to "only update part of its entries".
+         */
+        internal fun shouldApplyAutoRestrictions(isManualRefresh: Boolean): Boolean = !isManualRefresh
 
         private const val ERROR_LOG_HELP_URL = "https://mihon.app/docs/guides/troubleshooting/"
 
