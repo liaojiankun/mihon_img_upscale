@@ -12,6 +12,19 @@ The format is a modified version of [Keep a Changelog](https://keepachangelog.co
 
 ## [Unreleased]
 
+## [v1.3.24] - 2026-11-23
+
+### Improved
+- MediaTek NPU image enhancement is about 3x faster: a 1128x1600 page drops from ~5.5 s to ~1.8 s on Dimensity 9400+ (per-tile NPU execute 38→23 ms, host-side post-processing 56→10 ms).
+- Build the tile pipeline optimized in every variant; the debug build previously compiled the native hot path without optimization.
+- Ask the MediaTek compiler for TurboBoost/LowLatency via LiteRT vendor options. The preference only affects scheduling; the enhanced output is byte-identical with it on or off.
+
+### Fixed
+- Remove the periodic dark seam line that appeared on tile boundaries with Real-CUGAN SE/Pro.
+- Fix the washed-out, ghosted and near-black SPAN NomosUni output (missing output gain contract).
+- W2xEX on the MediaTek NPU path no longer downloads ncnn model assets, so it works offline and without the 15 s network timeout.
+- Compile each NPU model once per process instead of twice.
+
 ## [v1.3.23] - 2026-11-14
 
 ### Added
