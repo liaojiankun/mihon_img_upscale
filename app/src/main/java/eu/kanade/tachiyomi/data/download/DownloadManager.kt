@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.data.download
 
 import android.content.Context
+import androidx.work.ExistingWorkPolicy
 import dev.zacsweers.metro.AppScope
 import dev.zacsweers.metro.Inject
 import dev.zacsweers.metro.SingleIn
@@ -11,9 +12,12 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.asFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onStart
@@ -63,14 +67,16 @@ class DownloadManager(
     suspend fun downloaderStop(reason: String? = null) = downloader.stop(reason)
     val isDownloaderRunning
         get() = DownloadWorker.isRunningFlow(context)
+    internal val isDownloadQueueRunning
+        get() = downloader.isRunning
 
     /**
      * Starts the download worker, which runs the downloader.
      */
-    fun startDownloads() {
+    fun startDownloads(retryFailed: Boolean = false) {
         if (downloader.isRunning) return
 
-        DownloadWorker.start(context)
+        DownloadWorker.start(context, retryFailed = retryFailed)
     }
 
     /**
@@ -85,8 +91,9 @@ class DownloadManager(
      */
     suspend fun clearQueue() {
         downloader.clearQueue()
-        downloader.stop()
     }
+
+    suspend fun clearAllTransfers() = downloader.clearAllTransfers()
 
     /**
      * Returns the download from queue if the chapter is queued for download
@@ -108,7 +115,7 @@ class DownloadManager(
     suspend fun startDownloadNow(chapterId: Long) {
         // If not in queue try to start a new download
         val toAdd = getQueuedDownloadOrNull(chapterId) ?: downloadFromChapterId(chapterId) ?: return
-        downloader.updateQueue { queue ->
+        downloader.updateQueue(retryChapterId = chapterId) { queue ->
             val (existing, others) = queue.partition { it.chapter.id == chapterId }
             listOf(existing.firstOrNull() ?: toAdd) + others
         }
@@ -152,12 +159,39 @@ class DownloadManager(
 
     fun isCloudSyncAvailable(): Boolean = downloader.isCloudSyncAvailable()
 
+    internal suspend fun releaseCloudStorage(
+        manga: Manga,
+        targetId: String? = downloadPreferences.cloudSyncTargetId(),
+    ): CloudStorageReleaseResult = withContext(Dispatchers.IO) {
+        downloader.releaseCloudStorage(manga, targetId)
+    }
+
+    internal suspend fun deleteRemoteManga(manga: Manga, others: List<Manga>, onDeleted: suspend () -> Unit) {
+        withContext(Dispatchers.IO) { downloader.deleteRemoteManga(manga, others, onDeleted) }
+    }
+
     internal suspend fun cloudSyncChapters(
         manga: Manga,
         chapters: List<Chapter>,
         autoStart: Boolean = true,
+        automaticTarget: String? = null,
     ): CloudSyncQueueResult {
-        return downloader.queueChaptersForCloudSync(manga, chapters, autoStart)
+        return downloader.queueChaptersForCloudSync(manga, chapters, autoStart, automaticTarget)
+    }
+
+    internal fun startAutomaticDownloads() {
+        if (!downloader.isRunning && !downloader.isPaused) {
+            DownloadWorker.start(context, ExistingWorkPolicy.KEEP)
+        }
+    }
+
+    internal suspend fun runCloudUploads(networkAllowed: () -> Boolean): Boolean =
+        downloader.runCloudUploads(networkAllowed)
+
+    internal suspend fun retryAutomaticCloudSync(mangaIds: Set<Long>, target: String) {
+        downloader.retryCloudTransfers { download ->
+            download.automaticSyncTarget == target && download.manga.id in mangaIds
+        }
     }
 
     /**
@@ -183,7 +217,7 @@ class DownloadManager(
      * @return the list of pages from the chapter.
      */
     suspend fun buildPageList(source: Source, manga: Manga, chapter: Chapter): List<Page> {
-        val chapterDir = provider.findChapterDir(chapter.name, chapter.scanlator, chapter.url, manga.title, source)
+        val chapterDir = provider.findChapterDir(chapter, manga, source)
         val files = withContext(Dispatchers.IO) {
             chapterDir?.listFiles().orEmpty()
                 .filter { it.isFile && ImageUtil.isImage(it.name) { it.openInputStream() } }
@@ -205,8 +239,8 @@ class DownloadManager(
      * @param chapters the chapters to query, all of [manga].
      * @param manga the manga of the chapters.
      */
-    fun getDownloadedChapterIds(chapters: List<Chapter>, manga: Manga): Set<Long> {
-        return cache.getDownloadedChapterIds(chapters, manga.title, manga.source)
+    suspend fun getDownloadedChapterIds(chapters: List<Chapter>, manga: Manga): Set<Long> {
+        return cache.getDownloadedChapterIds(chapters, manga)
     }
 
     /**
@@ -230,19 +264,16 @@ class DownloadManager(
     /**
      * Returns true if the chapter is present on disk, bypassing the directory cache.
      *
-     * @param chapterName the name of the chapter to query.
-     * @param chapterScanlator scanlator of the chapter to query
-     * @param mangaTitle the title of the manga to query.
+     * @param chapter the chapter to query.
+     * @param manga the manga of the chapter.
      * @param source the source of the chapter.
      */
     suspend fun isChapterDownloadedOnDisk(
-        chapterName: String,
-        chapterScanlator: String?,
-        chapterUrl: String,
-        mangaTitle: String,
+        chapter: Chapter,
+        manga: Manga,
         source: Source,
     ): Boolean {
-        return provider.findChapterDir(chapterName, chapterScanlator, chapterUrl, mangaTitle, source) != null
+        return provider.findChapterDir(chapter, manga, source) != null
     }
 
     /**
@@ -274,16 +305,28 @@ class DownloadManager(
         downloader.dequeue(downloads.map { it.chapter })
     }
 
-    fun resumeCloudUpload(chapterId: Long) {
+    suspend fun resumeCloudUpload(chapterId: Long) {
         downloader.resumeCloudUpload(chapterId)
     }
 
-    fun pauseCloudUpload(chapterId: Long) {
+    suspend fun pauseCloudUpload(chapterId: Long) {
         downloader.pauseCloudUpload(chapterId)
     }
 
-    fun cancelCloudUpload(chapterId: Long) {
+    suspend fun cancelCloudUpload(chapterId: Long) {
         downloader.cancelCloudUpload(chapterId)
+    }
+
+    suspend fun resumeCloudUploads() {
+        downloader.resumeCloudUploads()
+    }
+
+    suspend fun pauseCloudUploads() {
+        downloader.pauseCloudUploads()
+    }
+
+    suspend fun cancelCloudUploads() {
+        downloader.cancelCloudUploads()
     }
 
     /**
@@ -440,7 +483,7 @@ class DownloadManager(
      * @param newChapter the target chapter with the new name.
      */
     suspend fun renameChapter(source: Source, manga: Manga, oldChapter: Chapter, newChapter: Chapter) {
-        val oldNames = provider.getValidChapterDirNames(oldChapter.name, oldChapter.scanlator, oldChapter.url)
+        val oldNames = provider.getChapterLookupNames(oldChapter)
         // Assume there's only 1 version of the chapter name formats present
         val mangaDirAndDownload = provider.findMangaDirs(manga.title, source).asSequence()
             .mapNotNull { mangaDir ->
@@ -452,12 +495,14 @@ class DownloadManager(
             .firstOrNull() ?: return
         val (mangaDir, oldDownload) = mangaDirAndDownload
 
-        var newName = provider.getChapterDirName(newChapter.name, newChapter.scanlator, newChapter.url)
-        if (oldDownload.isFile && oldDownload.extension == "cbz") {
-            newName += ".cbz"
-        }
+        val newName = provider.chapterOutputName(
+            newChapter,
+            asCbz =
+            oldDownload.isFile && oldDownload.extension == "cbz",
+        )
 
         if (oldDownload.name == newName) return
+        if (mangaDir.findFile(newName)?.uri?.let { it != oldDownload.uri } == true) return
 
         if (oldDownload.renameTo(newName)) {
             cache.removeChapter(oldChapter, manga)
@@ -494,19 +539,12 @@ class DownloadManager(
         downloads + uploads
     }
         .flatMapLatest { queue ->
-            queue
-                .map { download ->
-                    download.statusFlow.drop(1).map { download }.onStart { emit(download) }
-                }
-                .merge()
+            queue.map { download -> download.statusFlow.map { download } }.merge()
         }
-        .onStart {
-            emitAll(
-                (queueState.value + uploadQueueState.value).filter { download ->
-                    download.status == Download.State.DOWNLOADING || download.status == Download.State.UPLOADING
-                }.asFlow(),
-            )
-        }
+
+    internal fun downloadTaskCounts(): Flow<TransferTaskCounts> = queueState.taskCounts(Download.State.DOWNLOADING)
+
+    internal fun uploadTaskCounts(): Flow<TransferTaskCounts> = uploadQueueState.taskCounts(Download.State.UPLOADING)
 
     fun progressFlow(): Flow<Download> = kotlinx.coroutines.flow.combine(queueState, uploadQueueState) {
             downloads,
@@ -530,6 +568,22 @@ class DownloadManager(
             )
         }
 }
+
+internal data class TransferTaskCounts(val total: Int, val active: Int)
+
+private fun Flow<List<Download>>.taskCounts(activeState: Download.State): Flow<TransferTaskCounts> =
+    flatMapLatest { queue ->
+        if (queue.isEmpty()) {
+            flowOf(TransferTaskCounts(0, 0))
+        } else {
+            combine(queue.map(Download::statusFlow)) { states ->
+                TransferTaskCounts(
+                    total = states.count { it != Download.State.DOWNLOADED },
+                    active = states.count { it == activeState },
+                )
+            }
+        }
+    }.distinctUntilChanged()
 
 internal data class CloudSyncQueueResult(
     val downloadsQueued: Int = 0,

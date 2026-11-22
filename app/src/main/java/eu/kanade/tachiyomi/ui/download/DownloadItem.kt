@@ -63,11 +63,10 @@ class DownloadItem(
         return false
     }
 
-    override fun hashCode(): Int {
-        return if (isUpload) {
-            "upload-${download.chapter.id}".hashCode()
-        } else {
-            download.chapter.id.toInt()
-        }
+    override fun hashCode(): Int = stableId(download.chapter.id, isUpload).hashCode()
+
+    companion object {
+        fun stableId(chapterId: Long, isUpload: Boolean): Long =
+            (chapterId shl 1) + if (isUpload) 1 else 0
     }
 }

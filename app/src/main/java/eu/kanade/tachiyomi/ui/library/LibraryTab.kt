@@ -12,6 +12,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -36,11 +37,14 @@ import eu.kanade.presentation.category.components.ChangeCategoryDialog
 import eu.kanade.presentation.library.DeleteLibraryMangaDialog
 import eu.kanade.presentation.library.LibrarySettingsDialog
 import eu.kanade.presentation.library.components.LibraryContent
+import eu.kanade.presentation.library.components.LibrarySyncActions
 import eu.kanade.presentation.library.components.LibraryToolbar
 import eu.kanade.presentation.manga.components.LibraryBottomActionMenu
+import eu.kanade.presentation.manga.components.LocalMangaCoverSyncStatuses
 import eu.kanade.presentation.more.onboarding.GETTING_STARTED_URL
 import eu.kanade.presentation.util.Tab
 import eu.kanade.tachiyomi.R
+import eu.kanade.tachiyomi.data.download.CloudStorageReleaseWorker
 import eu.kanade.tachiyomi.data.library.LibraryUpdateWorker
 import eu.kanade.tachiyomi.ui.browse.source.globalsearch.GlobalSearchScreen
 import eu.kanade.tachiyomi.ui.category.CategoryScreen
@@ -53,6 +57,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import mihon.app.di.appGraph
 import mihon.feature.migration.config.MigrationConfigScreen
 import mihon.icons.materialsymbols.MaterialSymbols
 import mihon.icons.materialsymbols.automirroredrounded.Help
@@ -96,8 +101,17 @@ data object LibraryTab : Tab {
         val viewModel = metroViewModel<LibraryViewModel>()
         val settingsViewModel = metroViewModel<LibrarySettingsViewModel>()
         val state by viewModel.state.collectAsStateWithLifecycle()
+        val graph = context.appGraph
+        val libraryCloudSync = graph.libraryCloudSync
+        val syncSelection by libraryCloudSync.selection.collectAsStateWithLifecycle()
+        val syncStatuses by libraryCloudSync.categoryStatuses.collectAsStateWithLifecycle()
+        val coverStatuses by viewModel.coverSyncStatuses.collectAsStateWithLifecycle()
 
         val snackbarHostState = remember { SnackbarHostState() }
+        val releasingCategories by remember(context) {
+            CloudStorageReleaseWorker.activeCategories(context.applicationContext)
+        }.collectAsStateWithLifecycle(initialValue = emptySet())
+        var mangasToSync by remember { mutableStateOf<List<Manga>?>(null) }
 
         val onClickRefresh: suspend (Category?) -> Boolean = { category ->
             val started = LibraryUpdateWorker.startNow(context.workManager, category)
@@ -156,6 +170,9 @@ data object LibraryTab : Tab {
                     onDownloadClicked = viewModel::performDownloadAction
                         .takeIf { state.selectedManga.fastAll { !it.isLocal() } },
                     onDeleteClicked = viewModel::openDeleteMangaDialog,
+                    onCloudSyncClicked = {
+                        mangasToSync = state.selectedManga.filterNot { it.isLocal() }
+                    }.takeIf { syncSelection?.rules?.target != null && state.selectedManga.any { !it.isLocal() } },
                     onMigrateClicked = {
                         val selection = state.selection
                         viewModel.clearSelection()
@@ -184,45 +201,96 @@ data object LibraryTab : Tab {
                     )
                 }
                 else -> {
-                    LibraryContent(
-                        categories = state.displayedCategories,
-                        searchQuery = state.searchQuery,
-                        selection = state.selection,
-                        contentPadding = contentPadding,
-                        currentPage = state.coercedActiveCategoryIndex,
-                        hasActiveFilters = state.hasActiveFilters,
-                        showPageTabs = state.showCategoryTabs || !state.searchQuery.isNullOrEmpty(),
-                        onChangeCurrentPage = viewModel::updateActiveCategoryIndex,
-                        onClickManga = { navigator.push(MangaScreen(it)) },
-                        onContinueReadingClicked = { it: LibraryManga ->
-                            scope.launch {
-                                val chapter = viewModel.getNextUnreadChapter(it.manga)
-                                if (chapter != null) {
-                                    context.startActivity(
-                                        ReaderActivity.newIntent(context, chapter.mangaId, chapter.id),
+                    CompositionLocalProvider(LocalMangaCoverSyncStatuses provides coverStatuses) {
+                        LibraryContent(
+                            categories = state.displayedCategories,
+                            searchQuery = state.searchQuery,
+                            selection = state.selection,
+                            contentPadding = contentPadding,
+                            currentPage = state.coercedActiveCategoryIndex,
+                            hasActiveFilters = state.hasActiveFilters,
+                            showPageTabs = state.showCategoryTabs || !state.searchQuery.isNullOrEmpty(),
+                            syncCategoryIds = syncSelection?.rules?.categories.orEmpty(),
+                            syncStatuses = syncStatuses,
+                            syncActions = LibrarySyncActions(
+                                pausedCategories = syncSelection?.rules?.pausedCategories.orEmpty(),
+                                enabled = syncSelection?.rules?.target != null,
+                                releasingStorage = state.activeCategory?.id in releasingCategories,
+                                onPauseChanged = libraryCloudSync::setCategoryPaused,
+                                onReleaseStorage = { id ->
+                                    CloudStorageReleaseWorker.enqueue(
+                                        context,
+                                        categoryId = id,
+                                        targetId = syncSelection?.rules?.target,
                                     )
-                                } else {
-                                    snackbarHostState.showSnackbar(context.stringResource(MR.strings.no_next_chapter))
+                                },
+                            ),
+                            onChangeCurrentPage = viewModel::updateActiveCategoryIndex,
+                            onClickManga = { navigator.push(MangaScreen(it)) },
+                            onContinueReadingClicked = { it: LibraryManga ->
+                                scope.launch {
+                                    val chapter = viewModel.getNextUnreadChapter(it.manga)
+                                    if (chapter != null) {
+                                        context.startActivity(
+                                            ReaderActivity.newIntent(context, chapter.mangaId, chapter.id),
+                                        )
+                                    } else {
+                                        snackbarHostState.showSnackbar(
+                                            context.stringResource(MR.strings.no_next_chapter),
+                                        )
+                                    }
                                 }
-                            }
-                            Unit
-                        }.takeIf { state.showMangaContinueButton },
-                        onToggleSelection = viewModel::toggleSelection,
-                        onToggleRangeSelection = { category, manga ->
-                            viewModel.toggleRangeSelection(category, manga)
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        },
-                        onRefresh = { onClickRefresh(state.activeCategory) },
-                        onGlobalSearchClicked = {
-                            navigator.push(GlobalSearchScreen(viewModel.state.value.searchQuery ?: ""))
-                        },
-                        getItemCountForCategory = { state.getItemCountForCategory(it) },
-                        getDisplayMode = { viewModel.getDisplayMode() },
-                        getColumnsForOrientation = { viewModel.getColumnsForOrientation(it) },
-                        getItemsForCategory = { state.getItemsForCategory(it) },
-                    )
+                                Unit
+                            }.takeIf { state.showMangaContinueButton },
+                            onToggleSelection = viewModel::toggleSelection,
+                            onToggleRangeSelection = { category, manga ->
+                                viewModel.toggleRangeSelection(category, manga)
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            },
+                            onRefresh = { onClickRefresh(state.activeCategory) },
+                            onGlobalSearchClicked = {
+                                navigator.push(GlobalSearchScreen(viewModel.state.value.searchQuery ?: ""))
+                            },
+                            getItemCountForCategory = { state.getItemCountForCategory(it) },
+                            getDisplayMode = { viewModel.getDisplayMode() },
+                            getColumnsForOrientation = { viewModel.getColumnsForOrientation(it) },
+                            getItemsForCategory = { state.getItemsForCategory(it) },
+                        )
+                    }
                 }
             }
+        }
+
+        mangasToSync?.let { mangas ->
+            AlertDialog(
+                onDismissRequest = { mangasToSync = null },
+                title = { Text(stringResource(MR.strings.cloud_sync)) },
+                text = { Text(stringResource(MR.strings.cloud_sync_selected_manga_confirmation, mangas.size)) },
+                confirmButton = {
+                    TextButton(onClick = {
+                        mangasToSync = null
+                        viewModel.clearSelection()
+                        scope.launch {
+                            val result = viewModel.cloudSyncMangas(mangas)
+                            snackbarHostState.showSnackbar(
+                                context.stringResource(
+                                    MR.strings.cloud_sync_selected_manga_result,
+                                    result.queued,
+                                    result.skipped,
+                                    result.failed,
+                                ),
+                            )
+                        }
+                    }) {
+                        Text(stringResource(MR.strings.action_ok))
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { mangasToSync = null }) {
+                        Text(stringResource(MR.strings.action_cancel))
+                    }
+                },
+            )
         }
 
         val onDismissRequest = viewModel::closeDialog
@@ -251,10 +319,23 @@ data object LibraryTab : Tab {
             is LibraryViewModel.Dialog.DeleteManga -> {
                 DeleteLibraryMangaDialog(
                     containsLocalManga = dialog.manga.any(Manga::isLocal),
+                    canDeleteRemote = syncSelection?.rules?.target != null && dialog.manga.any { !it.isLocal() },
                     onDismissRequest = onDismissRequest,
-                    onConfirm = { deleteManga, deleteChapter ->
-                        viewModel.removeMangas(dialog.manga, deleteManga, deleteChapter)
+                    onConfirm = { deleteManga, deleteChapter, deleteRemote ->
                         viewModel.clearSelection()
+                        if (deleteRemote) {
+                            scope.launch {
+                                val failed = viewModel.removeMangasWithRemote(dialog.manga, deleteChapter)
+                                val message = if (failed > 0) {
+                                    context.stringResource(MR.strings.remote_sync_delete_failed_count, failed)
+                                } else {
+                                    context.stringResource(MR.strings.remote_sync_delete_success)
+                                }
+                                snackbarHostState.showSnackbar(message)
+                            }
+                        } else {
+                            viewModel.removeMangas(dialog.manga, deleteManga, deleteChapter)
+                        }
                     },
                 )
             }

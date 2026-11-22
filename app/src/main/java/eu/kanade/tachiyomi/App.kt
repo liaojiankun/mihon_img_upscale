@@ -14,6 +14,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.preference.PreferenceManager
+import androidx.work.WorkManager
 import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import coil3.memory.MemoryCache
@@ -39,7 +40,9 @@ import eu.kanade.tachiyomi.data.coil.InstalledSourceIconKeyer
 import eu.kanade.tachiyomi.data.coil.MangaCoverFetcher
 import eu.kanade.tachiyomi.data.coil.MangaCoverKeyer
 import eu.kanade.tachiyomi.data.coil.MangaKeyer
+import eu.kanade.tachiyomi.data.download.DownloadStore
 import eu.kanade.tachiyomi.data.notification.Notifications
+import eu.kanade.tachiyomi.data.notification.observeIdleTransferNotification
 import eu.kanade.tachiyomi.extension.ExtensionManager
 import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.network.NetworkPreferences
@@ -52,8 +55,10 @@ import eu.kanade.tachiyomi.util.system.isDebugBuildType
 import eu.kanade.tachiyomi.util.system.notify
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import logcat.AndroidLogcatLogger
 import logcat.LogPriority
@@ -115,6 +120,7 @@ class App : Application(), DefaultLifecycleObserver, SingletonImageLoader.Factor
     private lateinit var scope: CoroutineScope
 
     private val disableIncognitoReceiver = DisableIncognitoReceiver()
+    private val transferStatusRefresh = MutableStateFlow(0)
 
     @SuppressLint("LaunchActivityFromNotification")
     override fun onCreate() {
@@ -204,6 +210,11 @@ class App : Application(), DefaultLifecycleObserver, SingletonImageLoader.Factor
         }
 
         initializeMigrator()
+        // WorkManager is unavailable in the crash reporter process.
+        if (WorkManager.isInitialized()) {
+            graph.libraryCloudSync.start()
+            observeIdleTransferNotification(scope, transferStatusRefresh)
+        }
     }
 
     private fun initializeMigrator() {
@@ -275,6 +286,10 @@ class App : Application(), DefaultLifecycleObserver, SingletonImageLoader.Factor
 
     override fun onStart(owner: LifecycleOwner) {
         SecureActivityDelegate.onApplicationStart(this)
+        transferStatusRefresh.update { it + 1 }
+        scope.launch(Dispatchers.IO) {
+            if (DownloadStore.hasCloudUploads(this@App)) graph.downloadManager
+        }
     }
 
     override fun onStop(owner: LifecycleOwner) {

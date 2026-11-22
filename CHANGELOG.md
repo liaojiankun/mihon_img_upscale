@@ -12,6 +12,88 @@ The format is a modified version of [Keep a Changelog](https://keepachangelog.co
 
 ## [Unreleased]
 
+## [v1.3.23] - 2026-11-14
+
+### Added
+- Filter the library by cloud sync status.
+- Choose whether to skip an existing cloud file or delete it before uploading a replacement. The setting applies to chapter archives and metadata on WebDAV and OneDrive.
+
+### Fixed
+- Resume failed downloads and uploads from the transfer queue. Failed downloads show a failure label, keep their state across restarts, and allow individual retries.
+- Coordinate WebDAV directory creation when a chapter archive and metadata start uploading together.
+- Show separate download and upload counts while transfers are running.
+
+## [v1.3.22] - 2026-11-13
+
+### Added
+- Show a compact Android notification with the total number of transfer tasks and how many are running. Tap it to open the transfer queue. The notification can stay visible when idle.
+- Manage downloads and uploads independently in the transfer queue. Low power mode limits transfer concurrency.
+- Free local chapter storage after verifying the cloud copies. Backups can also include cloud storage sign-in details when explicitly selected.
+
+### Improved
+- Run manual and automatic cloud uploads in the background and retain queued work across connection interruptions.
+- Keep existing CBZ chapter downloads readable and resolve filename collisions without changing every archive name.
+- Make selection and display controls available when browsing sources.
+
+### Other
+- Increase Android versionCode to 54 and retain the existing Mihon Upscale signing identity for in-place upgrades.
+
+## [v1.3.21] - 2026-11-12
+
+### Added
+- Choose OneDrive or WebDAV for cloud sync. Each service remembers its own connection and destination.
+
+### Fixed
+- Complete OneDrive sign-in when Microsoft adds a trailing slash to the Android callback URL.
+
+## [v1.3.20] - 2026-11-11
+
+### Added
+- Prefer downloading synced chapters from WebDAV. The switch is on by default in Remote Sync settings, and downloads fall back to the original source when the cloud copy is unavailable.
+
+### Other
+- Increase Android versionCode to 52 for in-place upgrades.
+
+## [v1.3.19] - 2026-11-11
+
+This release includes all changes from v1.3.18.
+
+### Fixed
+- Show a manga's sync badge only in library categories that participate in WebDAV sync, including when the same manga belongs to both participating and nonparticipating categories.
+
+### Other
+- Increase Android versionCode to 51 for in-place upgrades.
+
+## [v1.3.18] - 2026-11-11
+
+### Added
+- Configure automatic WebDAV library sync by category in the new Remote Sync settings. Pause or resume individual categories and see sync status in the library and manga details.
+- Manage WebDAV uploads from the download queue. Pause, resume, retry or cancel individual uploads, and retain their state across app restarts.
+
+### Fixed
+- Preserve existing remote CBZ files on filename conflicts and replace `meta.info` only after its new contents have been uploaded. Keep ordinary chapter downloads running if metadata generation fails.
+- Scope chapter upload history to the WebDAV destination and account, hide upload actions when WebDAV is unavailable, and exclude the WebDAV password from ordinary settings backups.
+- Preserve INT8 (W8A8) when loading Real-ESRGAN Anime 2x on Qualcomm NPUs. Automatically use INT8 when FP16 is reported as unsupported, keep the page cache key consistent through the fallback, and discard old incorrectly labeled results and skip markers. Thanks to @akg002 for PR #29.
+
+### Removed
+- Remove spatial images from the reader. The feature is maintained separately on the codex/spatial-images branch.
+
+### Other
+- Increase Android versionCode to 50 for in-place upgrades from v1.3.17 and v1.3.18-beta.1.
+
+## [v1.3.18-beta.1] - 2026-11-07
+
+### Added
+- Save WebDAV upload tasks across app restarts. Resume interrupted uploads automatically and retain paused and failed tasks for manual recovery.
+- Show waiting, uploading, paused and failed states in the queue, with separate Continue and Retry actions.
+
+### Fixed
+- Hide chapter upload controls and upload marks when WebDAV is unavailable.
+- Track uploaded chapters by WebDAV server, account and destination so a new destination can receive the same chapters.
+- Preserve remote CBZ files on name conflicts and replace `meta.info` only after its new contents have been uploaded.
+- Keep ordinary chapter downloads running when `meta.info` generation fails.
+- Exclude the WebDAV password from ordinary settings backups.
+
 ## [v1.3.17] - 2026-10-31
 
 This stable release consolidates the final changes from the 1.3.17 beta cycle.

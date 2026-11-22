@@ -30,6 +30,10 @@ The first installation under the new package is a separate app. Export a backup 
 
 Release maintainers: [signing configuration and key backup](docs/release-signing.md).
 
+## Cloud sync
+
+Select OneDrive or WebDAV in **Settings → Remote sync → Cloud storage**, then connect and select a destination. Each service remembers its own destination. To connect OneDrive, sign in with Microsoft and grant access in your browser. See the [OneDrive setup guide](docs/onedrive-sync.md).
+
 ## Image enhancement
 
 Enable **Image enhancement** in the reader settings, then select a processing backend, model, and scale. Separate options control the input processing resolution, the resolution above which enhancement is skipped, and the preload range.
@@ -87,7 +91,7 @@ Both Qualcomm and MediaTek backends use the same 15 model variants. Qualcomm shi
 
 ## Reader features
 
-Retains Mihon's library, categories, tracking, backups, local reading, and webtoon support, with additional book page turns, image enhancement, ink filters, and Depth Anything V3 spatial images. Spatial images use a separate depth model and Qualcomm processing pipeline.
+Retains Mihon's library, categories, tracking, backups, local reading, and webtoon support, with additional book page turns, image enhancement, and ink filters.
 
 ## Building locally
 

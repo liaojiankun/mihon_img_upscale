@@ -30,6 +30,8 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
     private lateinit var download: Download
     private var isUpload: Boolean = false
 
+    fun isBoundTo(download: Download): Boolean = this.download === download
+
     /**
      * Binds this holder with the given category.
      *
@@ -48,44 +50,34 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
         binding.mangaFullTitle.text = download.manga.title
 
         // Update the progress bar and the number of downloaded pages
-        val pages = download.pages
-        if (isUpload && download.status == Download.State.ERROR) {
-            binding.downloadProgress.progress = download.uploadProgress
+        if (isUpload) {
             binding.downloadProgress.max = 100
-            binding.downloadProgressText.text = view.context.stringResource(MR.strings.chapter_paused)
-        } else if (download.status == Download.State.UPLOADING) {
             binding.downloadProgress.progress = download.uploadProgress
-            binding.downloadProgress.max = 100
-            notifyDownloadedPages()
-        } else if (pages == null) {
-            binding.downloadProgress.progress = 0
-            binding.downloadProgress.max = 1
-            binding.downloadProgressText.text = ""
-        } else {
-            binding.downloadProgress.max = pages.size * 100
-            notifyProgress()
-            notifyDownloadedPages()
         }
+        notifyProgress()
+        notifyDownloadedPages()
     }
 
     /**
      * Updates the progress bar of the download.
      */
     fun notifyProgress() {
-        if (isUpload && download.status == Download.State.ERROR) {
-            binding.downloadProgress.max = 100
-            binding.downloadProgress.setProgressCompat(download.uploadProgress, true)
+        if (isUpload) {
+            val uploading = download.status == Download.State.UPLOADING
+            binding.downloadProgress.visibility = if (uploading) View.VISIBLE else View.INVISIBLE
+            if (uploading) binding.downloadProgress.setProgressCompat(download.uploadProgress, true)
             return
         }
-        if (download.status == Download.State.UPLOADING) {
-            binding.downloadProgress.max = 100
-            binding.downloadProgress.setProgressCompat(download.uploadProgress, true)
+        val failed = download.status == Download.State.ERROR
+        binding.downloadProgress.visibility = if (failed) View.INVISIBLE else View.VISIBLE
+        if (failed) return
+        val pages = download.pages
+        if (pages == null) {
+            binding.downloadProgress.progress = 0
+            binding.downloadProgress.max = 1
             return
         }
-        val pages = download.pages ?: return
-        if (binding.downloadProgress.max == 1) {
-            binding.downloadProgress.max = pages.size * 100
-        }
+        binding.downloadProgress.max = pages.size * 100
         binding.downloadProgress.setProgressCompat(download.totalProgress, true)
     }
 
@@ -93,19 +85,26 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
      * Updates the text field of the number of downloaded pages.
      */
     fun notifyDownloadedPages() {
-        if (isUpload && download.status == Download.State.ERROR) {
-            binding.downloadProgressText.text = view.context.stringResource(MR.strings.chapter_paused)
+        if (isUpload) {
+            val context = view.context
+            binding.downloadProgressText.text = when (download.status) {
+                Download.State.QUEUE -> context.stringResource(MR.strings.cloud_sync_upload_queued)
+                Download.State.PAUSED -> context.stringResource(MR.strings.cloud_sync_upload_paused)
+                Download.State.ERROR -> context.stringResource(MR.strings.cloud_sync_upload_failed)
+                Download.State.UPLOADING -> context.stringResource(
+                    MR.strings.cloud_sync_uploading_progress,
+                    download.uploadProgress,
+                )
+                else -> ""
+            }
             return
         }
-        if (download.status == Download.State.UPLOADING) {
-            binding.downloadProgressText.text = view.context.stringResource(
-                MR.strings.cloud_sync_uploading_progress,
-                download.uploadProgress,
-            )
-            return
+        val pages = download.pages
+        binding.downloadProgressText.text = when {
+            download.status == Download.State.ERROR -> view.context.stringResource(MR.strings.download_queue_failed)
+            pages != null -> "${download.downloadedImages}/${pages.size}"
+            else -> ""
         }
-        val pages = download.pages ?: return
-        binding.downloadProgressText.text = "${download.downloadedImages}/${pages.size}"
     }
 
     override fun onItemReleased(position: Int) {
@@ -126,12 +125,23 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
             menuRes = if (isUpload) R.menu.upload_single else R.menu.download_single,
             initMenu = {
                 if (isUpload) {
-                    findItem(R.id.resume_upload).isVisible = download.status == Download.State.ERROR
-                    findItem(R.id.pause_upload).isVisible = download.status != Download.State.ERROR
+                    val status = download.status
+                    findItem(R.id.resume_upload).apply {
+                        isVisible = status == Download.State.PAUSED || status == Download.State.ERROR
+                        if (status == Download.State.ERROR) {
+                            title = view.context.stringResource(MR.strings.action_retry)
+                        }
+                    }
+                    findItem(R.id.pause_upload).isVisible =
+                        status == Download.State.QUEUE || status == Download.State.UPLOADING
                 } else {
-                    findItem(R.id.move_to_top).isVisible = bindingAdapterPosition > 1
+                    findItem(R.id.retry_download).isVisible = download.status == Download.State.ERROR
+                    val position = bindingAdapterPosition
+                    val header = (adapter.getItem(position) as? DownloadItem)?.header
+                    findItem(R.id.move_to_top).isVisible =
+                        header != null && (adapter.getItem(position - 1) as? DownloadItem)?.header == header
                     findItem(R.id.move_to_bottom).isVisible =
-                        bindingAdapterPosition != adapter.itemCount - 1
+                        header != null && (adapter.getItem(position + 1) as? DownloadItem)?.header == header
                 }
             },
             onMenuItemClick = {

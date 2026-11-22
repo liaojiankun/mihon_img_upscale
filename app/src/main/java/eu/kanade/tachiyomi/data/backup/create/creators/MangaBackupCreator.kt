@@ -33,12 +33,17 @@ class MangaBackupCreator(
      * Builds the entries a chunk at a time, so only one chunk's chapters are held at once.
      */
     operator fun invoke(mangas: List<Manga>, options: BackupOptions): Flow<BackupManga> = flow {
+        val cloudRecords = CloudSyncBackupRecords(downloadPreferences)
         mangas.chunked(CHUNK_SIZE).forEach { chunk ->
-            backupMangas(chunk, options).forEach { emit(it) }
+            backupMangas(chunk, options, cloudRecords).forEach { emit(it) }
         }
     }
 
-    private suspend fun backupMangas(mangas: List<Manga>, options: BackupOptions): List<BackupManga> {
+    private suspend fun backupMangas(
+        mangas: List<Manga>,
+        options: BackupOptions,
+        cloudRecords: CloudSyncBackupRecords,
+    ): List<BackupManga> {
         val mangaIds = mangas.map { it.id }
 
         val excludedScanlatorsByMangaId = mangaRepository.getExcludedScanlatorsByMangaIds(mangaIds)
@@ -58,15 +63,20 @@ class MangaBackupCreator(
 
         return mangas.map { manga ->
             val mangaObject = manga.toBackupManga()
-            mangaObject.cloudSyncMetaInfoHash = downloadPreferences.uploadedMetaInfoHash(manga.id)
             val chapters = chaptersByMangaId[manga.id].orEmpty()
+            mangaObject.cloudSyncStates =
+                cloudRecords.forManga(manga.id, if (options.chapters) chapters else emptyList())
+            val legacyState = mangaObject.cloudSyncStates.firstOrNull { it.targetId == cloudRecords.currentTarget }
+            mangaObject.cloudSyncTargetId = legacyState?.targetId
+            mangaObject.cloudSyncMetaInfoHash = legacyState?.metaInfoHash
+            val legacyUploadedUrls = legacyState?.chapterUrls?.toSet().orEmpty()
 
             mangaObject.excludedScanlators = excludedScanlatorsByMangaId[manga.id].orEmpty()
 
             if (options.chapters) {
                 mangaObject.chapters = chapters.map { chapter ->
                     chapter.toBackupChapter().apply {
-                        cloudSynced = downloadPreferences.isChapterUploadedToCloud(chapter.id)
+                        cloudSynced = chapter.url in legacyUploadedUrls
                     }
                 }
             }

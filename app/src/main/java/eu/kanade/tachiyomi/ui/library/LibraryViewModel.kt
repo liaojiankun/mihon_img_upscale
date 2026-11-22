@@ -22,11 +22,14 @@ import eu.kanade.presentation.manga.DownloadAction
 import eu.kanade.tachiyomi.data.cache.CoverCache
 import eu.kanade.tachiyomi.data.download.DownloadCache
 import eu.kanade.tachiyomi.data.download.DownloadManager
+import eu.kanade.tachiyomi.data.download.CloudCoverStatus
+import eu.kanade.tachiyomi.data.download.LibraryCloudSync
 import eu.kanade.tachiyomi.data.track.TrackerManager
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.chapter.getNextUnread
 import eu.kanade.tachiyomi.util.removeCovers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
@@ -47,6 +50,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.plus
 import kotlinx.coroutines.withContext
+import logcat.LogPriority
 import mihon.core.common.utils.mutate
 import mihon.core.metro.AppCoroutineScope
 import mihon.domain.library.model.search.QueryNode
@@ -57,6 +61,7 @@ import tachiyomi.core.common.util.lang.SubscriberGate
 import tachiyomi.core.common.util.lang.compareToWithCollator
 import tachiyomi.core.common.util.lang.pausedWhileUnsubscribed
 import tachiyomi.core.common.util.lang.withIOContext
+import tachiyomi.core.common.util.system.logcat
 import tachiyomi.domain.category.interactor.GetCategories
 import tachiyomi.domain.category.interactor.SetMangaCategories
 import tachiyomi.domain.category.model.Category
@@ -99,9 +104,21 @@ class LibraryViewModel(
     private val coverCache: CoverCache,
     private val sourceManager: SourceManager,
     private val downloadManager: DownloadManager,
+    private val libraryCloudSync: LibraryCloudSync,
     private val downloadCache: DownloadCache,
     private val trackerManager: TrackerManager,
 ) : ViewModel() {
+
+    internal val coverSyncStatuses = libraryCloudSync.coverStatuses(downloadManager, downloadCache)
+        .stateIn(viewModelScope, SharingStarted.Lazily, emptyMap())
+
+    private val cloudSyncFilter = libraryPreferences.filterCloudSync.changes().flatMapLatest { filter ->
+        if (filter == TriState.DISABLED) {
+            flowOf(filter to emptyMap())
+        } else {
+            coverSyncStatuses.map { filter to it }
+        }
+    }
 
     val isCloudSyncAvailable: Boolean
         get() = downloadManager.isCloudSyncAvailable()
@@ -152,9 +169,11 @@ class LibraryViewModel(
     private val hasActiveFilters = combine(
         getLibraryItemPreferencesFlow(),
         getTrackingFiltersFlow(),
-    ) { prefs, trackFilters ->
+        libraryPreferences.filterCloudSync.changes(),
+    ) { prefs, trackFilters, filterCloudSync ->
         listOf(
             prefs.filterDownloaded,
+            filterCloudSync,
             prefs.filterUnread,
             prefs.filterStarted,
             prefs.filterBookmarked,
@@ -182,11 +201,23 @@ class LibraryViewModel(
         getCategories.subscribe(),
         getFavoritesFlow(),
         combine(tracks, getTrackingFiltersFlow(), ::Pair),
-        getLibraryItemPreferencesFlow(),
-    ) { searchQuery, categories, favorites, (tracksMap, trackingFilters), itemPreferences ->
+        combine(getLibraryItemPreferencesFlow(), cloudSyncFilter, ::Pair),
+    ) { searchQuery, categories, favorites, (tracksMap, trackingFilters), (itemPreferences, syncFilter) ->
         val showSystemCategory = favorites.any { it.libraryManga.categories.contains(0) }
         val filteredFavorites = favorites
             .applyFilters(tracksMap, trackingFilters, itemPreferences)
+            .let { items ->
+                val (filter, statuses) = syncFilter
+                if (filter == TriState.DISABLED) {
+                    items
+                } else {
+                    items.fastFilter { item ->
+                        val status = statuses[item.id] ?: return@fastFilter false
+                        val synced = status == CloudCoverStatus.CloudOnly || status == CloudCoverStatus.LocalCopy
+                        synced == (filter == TriState.ENABLED_IS)
+                    }
+                }
+            }
             .let { libraryItems ->
                 if (searchQuery.isNullOrEmpty()) {
                     libraryItems
@@ -564,7 +595,7 @@ class LibraryViewModel(
         }
     }
 
-    private fun List<Chapter>.filterNotQueuedOrDownloaded(manga: Manga): List<Chapter> {
+    private suspend fun List<Chapter>.filterNotQueuedOrDownloaded(manga: Manga): List<Chapter> {
         val queuedDownloads = downloadManager.getQueuedDownloadsByChapterId()
         val downloadedChapterIds = downloadManager.getDownloadedChapterIds(this, manga)
         return fastFilterNot { it.id in queuedDownloads || it.id in downloadedChapterIds }
@@ -614,6 +645,33 @@ class LibraryViewModel(
                 }
             }
         }
+    }
+
+    suspend fun removeMangasWithRemote(mangas: List<Manga>, deleteChapters: Boolean): Int = withIOContext {
+        var failures = 0
+        for (manga in mangas.distinctBy { it.id }) {
+            val removeFromLibrary: suspend () -> Unit = {
+                check(updateManga.await(MangaUpdate(manga.id) { favoriteAt = null }))
+                manga.removeCovers(coverCache)
+            }
+            try {
+                if (manga.isLocal()) {
+                    removeFromLibrary()
+                } else {
+                    libraryCloudSync.deleteRemoteManga(manga, removeFromLibrary)
+                    if (deleteChapters) {
+                        val source = sourceManager.getOrStub(manga.source)
+                        downloadManager.deleteManga(manga, source)
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                failures++
+                logcat(LogPriority.WARN, error) { "Failed to remove remote manga ${manga.id}" }
+            }
+        }
+        failures
     }
 
     /**

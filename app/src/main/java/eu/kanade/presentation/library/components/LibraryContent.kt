@@ -16,6 +16,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalLayoutDirection
 import eu.kanade.core.preference.PreferenceMutableState
+import eu.kanade.tachiyomi.data.download.CloudSyncStatus
 import eu.kanade.tachiyomi.ui.library.LibraryItem
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -26,7 +27,7 @@ import tachiyomi.presentation.core.components.material.PullRefresh
 import kotlin.time.Duration.Companion.seconds
 
 @Composable
-fun LibraryContent(
+internal fun LibraryContent(
     categories: List<Category>,
     searchQuery: String?,
     selection: Set<Long>,
@@ -34,6 +35,9 @@ fun LibraryContent(
     currentPage: Int,
     hasActiveFilters: Boolean,
     showPageTabs: Boolean,
+    syncCategoryIds: Set<Long>,
+    syncStatuses: Map<Long, CloudSyncStatus>,
+    syncActions: LibrarySyncActions,
     onChangeCurrentPage: (Int) -> Unit,
     onClickManga: (Long) -> Unit,
     onContinueReadingClicked: ((LibraryManga) -> Unit)?,
@@ -58,7 +62,10 @@ fun LibraryContent(
         val scope = rememberCoroutineScope()
         var isRefreshing by remember(pagerState.currentPage) { mutableStateOf(false) }
 
-        if (showPageTabs && categories.isNotEmpty() && (categories.size > 1 || !categories.first().isSystemCategory)) {
+        val showDefaultTab = syncActions.enabled || categories.firstOrNull()?.id in syncStatuses
+        if (showPageTabs && categories.isNotEmpty() &&
+            (categories.size > 1 || !categories.first().isSystemCategory || showDefaultTab)
+        ) {
             LaunchedEffect(categories) {
                 if (categories.size <= pagerState.currentPage) {
                     pagerState.scrollToPage(categories.size - 1)
@@ -68,6 +75,8 @@ fun LibraryContent(
                 categories = categories,
                 pagerState = pagerState,
                 getItemCountForCategory = getItemCountForCategory,
+                syncStatuses = syncStatuses,
+                syncActions = syncActions,
                 onTabItemClick = {
                     scope.launch {
                         pagerState.animateScrollToPage(it)
@@ -95,6 +104,7 @@ fun LibraryContent(
                 hasActiveFilters = hasActiveFilters,
                 selection = selection,
                 searchQuery = searchQuery,
+                syncCategoryIds = syncCategoryIds,
                 onGlobalSearchClicked = onGlobalSearchClicked,
                 getCategoryForPage = { page -> categories[page] },
                 getDisplayMode = getDisplayMode,

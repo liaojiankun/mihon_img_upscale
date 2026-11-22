@@ -50,6 +50,8 @@ class BackupManga(
     @ProtoNumber(112) var memo: ByteArray = JsonObjectEmptyBytes,
     @ProtoNumber(113) var nextUpdate: Long = 0,
     @ProtoNumber(1000) var cloudSyncMetaInfoHash: String? = null,
+    @ProtoNumber(1001) var cloudSyncTargetId: String? = null,
+    @ProtoNumber(1002) var cloudSyncStates: List<BackupCloudSyncState> = emptyList(),
 ) {
     fun getMangaImpl(): Manga {
         return Manga.create().copy(

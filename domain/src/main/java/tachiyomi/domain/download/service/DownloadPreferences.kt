@@ -5,6 +5,8 @@ import dev.zacsweers.metro.Inject
 import dev.zacsweers.metro.SingleIn
 import tachiyomi.core.common.preference.Preference
 import tachiyomi.core.common.preference.PreferenceStore
+import tachiyomi.core.common.preference.getEnum
+import java.security.MessageDigest
 
 @Inject
 @SingleIn(AppScope::class)
@@ -19,21 +21,88 @@ class DownloadPreferences(
 
     val saveChaptersAsCBZ: Preference<Boolean> = preferenceStore.getBoolean("save_chapter_as_cbz", true)
 
+    val showIdleTransferNotification: Preference<Boolean> =
+        preferenceStore.getBoolean("show_idle_transfer_notification", true)
+
     fun organizeDownloadsByCategory() = preferenceStore.getBoolean("organize_downloads_by_category", false)
 
     fun addRandomNonceToCBZ() = preferenceStore.getBoolean("add_random_nonce_to_cbz", false)
 
     fun cloudSyncEnabled() = preferenceStore.getBoolean("cloud_sync_enabled", false)
 
-    fun cloudSyncUrl() = preferenceStore.getString("cloud_sync_url", "")
+    fun cloudSyncUrl() = preferenceStore.getString(CLOUD_SYNC_URL_PREF_KEY, "")
 
-    fun cloudSyncUsername() = preferenceStore.getString("cloud_sync_username", "")
+    fun cloudSyncUsername() = preferenceStore.getString(CLOUD_SYNC_USERNAME_PREF_KEY, "")
 
-    fun cloudSyncPassword() = preferenceStore.getString("cloud_sync_password", "")
+    fun cloudSyncPassword() = preferenceStore.getString(CLOUD_SYNC_PASSWORD_PREF_KEY, "")
 
-    fun cloudSyncDestination() = preferenceStore.getString("cloud_sync_destination", "")
+    fun cloudSyncStorage() = preferenceStore.getEnum("cloud_sync_storage", CloudSyncStorage.WebDav)
+
+    fun cloudSyncOneDriveId() = preferenceStore.getString(Preference.appStateKey("cloud_sync_onedrive_id"), "")
+
+    fun cloudSyncOneDriveAccountFingerprint() = preferenceStore.getString("cloud_sync_onedrive_account_fingerprint", "")
+
+    fun cloudSyncDestination(storage: CloudSyncStorage = cloudSyncStorage().get()) = when (storage) {
+        CloudSyncStorage.WebDav -> preferenceStore.getString("cloud_sync_destination", "")
+        CloudSyncStorage.OneDrive -> preferenceStore.getString("cloud_sync_onedrive_destination", "")
+    }
+
+    fun cloudSyncPreferRemoteDownloads() = preferenceStore.getBoolean("cloud_sync_prefer_webdav_downloads", true)
+    fun cloudSyncOverwriteUploads() = preferenceStore.getBoolean("cloud_sync_overwrite_uploads", false)
 
     fun cloudSyncDeleteAfterUpload() = preferenceStore.getBoolean("cloud_sync_delete_after_upload", false)
+
+    fun cloudSyncCategories() = preferenceStore.getStringSet(CLOUD_SYNC_CATEGORIES_PREF_KEY, emptySet())
+
+    fun remoteSyncCategories() = preferenceStore.getStringSet(REMOTE_SYNC_CATEGORIES_PREF_KEY, emptySet())
+
+    fun remoteSyncScanFailures() = preferenceStore.getStringSet(
+        Preference.appStateKey("remote_sync_scan_failures"),
+        emptySet(),
+    )
+
+    fun remoteSyncMangaFolders() = preferenceStore.getStringSet(
+        Preference.appStateKey("remote_sync_manga_folders"),
+        emptySet(),
+    )
+
+    @Synchronized
+    fun markRemoteSyncMangaFolder(mangaId: Long, targetId: String, folder: String) {
+        val preference = remoteSyncMangaFolders()
+        val key = "$targetId:$mangaId:$folder"
+        val folders = preference.get()
+        if (key !in folders) preference.set(folders + key)
+    }
+
+    @Synchronized
+    fun clearRemoteSyncManga(mangaId: Long, targetId: String, chapterIds: Collection<Long>) {
+        val chapters = cloudUploadedChapterIds()
+        chapters.set(chapters.get() - chapterIds.map { "$targetId:$it" }.toSet())
+        val prefix = "$targetId:$mangaId:"
+        cloudChapterUploadPreference(mangaId, targetId).delete()
+        val folders = remoteSyncMangaFolders()
+        folders.set(folders.get().filterNot { it.startsWith(prefix) }.toSet())
+        val metadata = cloudUploadedMetaInfoHashes()
+        metadata.set(metadata.get().filterNot { it.startsWith(prefix) || it.startsWith("$mangaId:") }.toSet())
+    }
+
+    @Synchronized
+    fun migrateRemoteSyncScope() {
+        val categories = remoteSyncCategories()
+        if (categories.isSet()) return
+        val legacySources = preferenceStore.getStringSet("cloud_sync_sources", emptySet())
+        val remoteSources = preferenceStore.getStringSet("remote_sync_sources", emptySet())
+        when {
+            remoteSources.isSet() -> categories.set(emptySet())
+            organizeDownloadsByCategory().get() && cloudSyncCategories().isSet() ->
+                categories.set(cloudSyncCategories().get())
+            !organizeDownloadsByCategory().get() && legacySources.isSet() -> categories.set(emptySet())
+        }
+    }
+
+    fun cloudSyncAutomaticPaused() = preferenceStore.getBoolean("cloud_sync_automatic_paused", false)
+
+    fun cloudSyncPausedCategories() = preferenceStore.getStringSet(CLOUD_SYNC_PAUSED_CATEGORIES_PREF_KEY, emptySet())
 
     fun parallelCloudUploadLimit() = preferenceStore.getInt("cloud_sync_parallel_upload_limit", 5)
 
@@ -43,31 +112,77 @@ class DownloadPreferences(
         emptySet(),
     )
 
-    fun isChapterUploadedToCloud(chapterId: Long): Boolean {
-        return chapterId.toString() in cloudUploadedChapterIds().get()
+    fun cloudSyncTargetId(
+        storage: CloudSyncStorage = cloudSyncStorage().get(),
+        account: String = when (storage) {
+            CloudSyncStorage.WebDav -> cloudSyncUsername().get()
+            CloudSyncStorage.OneDrive -> cloudSyncOneDriveId().get()
+        },
+        destination: String = cloudSyncDestination(storage).get(),
+        url: String = cloudSyncUrl().get(),
+    ): String? {
+        if (account.isBlank() || destination.isBlank()) return null
+        val path = destination.replace('\\', '/').split('/').filter { it.isNotBlank() }.joinToString("/")
+        val endpoint = when (storage) {
+            CloudSyncStorage.WebDav -> url.trim().trimEnd('/').takeIf { it.isNotBlank() } ?: return null
+            CloudSyncStorage.OneDrive -> "\u0000onedrive"
+        }
+        return MessageDigest.getInstance("SHA-256")
+            .digest("$endpoint\u0000$account\u0000$path".toByteArray())
+            .toHexString()
     }
 
-    fun markChapterUploadedToCloud(chapterId: Long) {
-        markChaptersUploadedToCloud(listOf(chapterId))
+    fun isChapterUploadedToCloud(chapterId: Long, targetId: String?): Boolean {
+        return targetId != null && "$targetId:$chapterId" in cloudUploadedChapterIds().get()
     }
 
-    fun markChaptersUploadedToCloud(chapterIds: Collection<Long>) {
+    @Synchronized
+    fun markChaptersUploadedToCloud(chapterIds: Collection<Long>, targetId: String) {
         if (chapterIds.isEmpty()) return
-        cloudUploadedChapterIds().set(cloudUploadedChapterIds().get() + chapterIds.map { it.toString() })
+        cloudUploadedChapterIds().set(cloudUploadedChapterIds().get() + chapterIds.map { "$targetId:$it" })
     }
 
-    fun uploadedMetaInfoHash(mangaId: Long): String? {
+    private fun cloudChapterUploadPreference(mangaId: Long, targetId: String) = preferenceStore.getStringSet(
+        Preference.appStateKey("cloud_chapter_uploads_${targetId}_$mangaId"),
+        emptySet(),
+    )
+
+    fun cloudChapterUploads(mangaId: Long, targetId: String): Map<Long, CloudChapterUpload> {
+        return cloudChapterUploadPreference(mangaId, targetId).get().asSequence()
+            .mapNotNull { entry ->
+                val parts = entry.split(':', limit = 3)
+                if (parts.size != 3) return@mapNotNull null
+                val chapterId = parts[0].toLongOrNull() ?: return@mapNotNull null
+                val size = parts[1].toLongOrNull()?.takeIf { it > 0 }
+                val path = parts[2]
+                chapterId to CloudChapterUpload(path.substringBeforeLast('/'), path.substringAfterLast('/'), size)
+            }
+            .toMap()
+    }
+
+    @Synchronized
+    fun recordCloudChapterUpload(mangaId: Long, chapterId: Long, targetId: String, upload: CloudChapterUpload) {
+        val prefix = "$chapterId:"
+        val preference = cloudChapterUploadPreference(mangaId, targetId)
+        val entry = "$prefix${upload.size ?: 0}:${upload.directory.trimEnd('/')}/${upload.fileName}"
+        val uploads = preference.get()
+        if (entry !in uploads) preference.set(uploads.filterNot { it.startsWith(prefix) }.toSet() + entry)
+    }
+
+    fun uploadedMetaInfoHash(mangaId: Long, targetId: String): String? {
+        val prefix = "$targetId:$mangaId:"
         return cloudUploadedMetaInfoHashes().get()
-            .firstOrNull { it.substringBefore(':') == mangaId.toString() }
-            ?.substringAfter(':', "")
+            .firstOrNull { it.startsWith(prefix) }
+            ?.removePrefix(prefix)
             ?.takeIf { it.isNotBlank() }
     }
 
-    fun markMetaInfoUploadedToCloud(mangaId: Long, contentHash: String) {
-        val prefix = "$mangaId:"
+    @Synchronized
+    fun markMetaInfoUploadedToCloud(mangaId: Long, contentHash: String, targetId: String) {
+        val prefix = "$targetId:$mangaId:"
         val updated = cloudUploadedMetaInfoHashes().get()
             .filterNot { it.startsWith(prefix) }
-            .toSet() + "$mangaId:$contentHash"
+            .toSet() + "$prefix$contentHash"
         cloudUploadedMetaInfoHashes().set(updated)
     }
 
@@ -106,24 +221,41 @@ class DownloadPreferences(
         false,
     )
 
+    val lowPowerMode: Preference<Boolean> = preferenceStore.getBoolean("download_low_power_mode", true)
+
     val parallelSourceLimit: Preference<Int> = preferenceStore.getInt("download_parallel_source_limit", 5)
 
     val parallelPageLimit: Preference<Int> = preferenceStore.getInt("download_parallel_page_limit", 5)
 
     companion object {
+        const val LOW_POWER_CLOUD_UPLOAD_LIMIT = 2
         private const val REMOVE_EXCLUDE_CATEGORIES_PREF_KEY = "remove_exclude_categories"
+        const val CLOUD_SYNC_URL_PREF_KEY = "cloud_sync_url"
+        private const val CLOUD_SYNC_USERNAME_PREF_KEY = "cloud_sync_username"
+        const val CLOUD_SYNC_PASSWORD_PREF_KEY = "cloud_sync_password"
+        val cloudStorageLoginPreferenceKeys = setOf(CLOUD_SYNC_USERNAME_PREF_KEY, CLOUD_SYNC_PASSWORD_PREF_KEY)
         private const val DOWNLOAD_NEW_CATEGORIES_PREF_KEY = "download_new_categories"
         private const val DOWNLOAD_NEW_CATEGORIES_EXCLUDE_PREF_KEY = "download_new_categories_exclude"
         private const val CLOUD_UPLOADED_CHAPTER_IDS_PREF_KEY = "cloud_uploaded_chapter_ids"
         private const val CLOUD_UPLOADED_META_INFO_HASHES_PREF_KEY = "cloud_uploaded_meta_info_hashes"
+        private const val CLOUD_SYNC_CATEGORIES_PREF_KEY = "cloud_sync_categories"
+        private const val CLOUD_SYNC_PAUSED_CATEGORIES_PREF_KEY = "cloud_sync_paused_categories"
+        private const val REMOTE_SYNC_CATEGORIES_PREF_KEY = "remote_sync_categories"
         val cloudSyncRecordPreferenceKeys = setOf(
             CLOUD_UPLOADED_CHAPTER_IDS_PREF_KEY,
             CLOUD_UPLOADED_META_INFO_HASHES_PREF_KEY,
         )
-        val categoryPreferenceKeys = setOf(
+        val cloudSyncCategoryPreferenceKeys = setOf(
+            CLOUD_SYNC_CATEGORIES_PREF_KEY,
+            CLOUD_SYNC_PAUSED_CATEGORIES_PREF_KEY,
+            REMOTE_SYNC_CATEGORIES_PREF_KEY,
+        )
+        val categoryPreferenceKeys = cloudSyncCategoryPreferenceKeys + setOf(
             REMOVE_EXCLUDE_CATEGORIES_PREF_KEY,
             DOWNLOAD_NEW_CATEGORIES_PREF_KEY,
             DOWNLOAD_NEW_CATEGORIES_EXCLUDE_PREF_KEY,
         )
     }
 }
+
+data class CloudChapterUpload(val directory: String, val fileName: String, val size: Long?)

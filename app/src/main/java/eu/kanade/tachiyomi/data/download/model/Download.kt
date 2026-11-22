@@ -22,7 +22,13 @@ data class Download(
     val source: HttpSource,
     val manga: Manga,
     val chapter: Chapter,
+    val automaticSyncTarget: String? = null,
+    val explicitCloudSync: Boolean = false,
+    val explicitSyncTarget: String? = null,
 ) {
+    val isCloudSync get() = automaticSyncTarget != null || explicitCloudSync
+    val cloudSyncTarget get() = automaticSyncTarget ?: explicitSyncTarget
+
     @Transient
     private val _pagesFlow = MutableStateFlow<List<Page>?>(null)
 
@@ -88,5 +94,6 @@ data class Download(
         UPLOADING(3),
         DOWNLOADED(4),
         ERROR(5),
+        PAUSED(6),
     }
 }

@@ -1,0 +1,594 @@
+package eu.kanade.tachiyomi.data.download
+
+import com.hippo.unifile.UniFile
+import eu.kanade.tachiyomi.network.await
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import okhttp3.CacheControl
+import okhttp3.Credentials
+import okhttp3.Headers
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okio.Buffer
+import okio.BufferedSink
+import okio.source
+import org.w3c.dom.Element
+import org.xml.sax.SAXException
+import tachiyomi.core.common.util.lang.withIOContext
+import java.io.IOException
+import java.io.InputStream
+import javax.xml.parsers.DocumentBuilderFactory
+
+internal class WebDavStorage(
+    private val config: WebDavConfig,
+    private val client: OkHttpClient,
+    private val uploadClient: OkHttpClient,
+    private val directoryLock: Mutex,
+) : CloudStorage {
+
+    override suspend fun listDirectories(path: String): List<CloudSyncDirectory> = withIOContext {
+        val request = Request.Builder()
+            .url(config.resolveUrl(path, trailingSlash = true))
+            .headers(config.authHeaders())
+            .header("Depth", "1")
+            .method("PROPFIND", PROPFIND_BODY)
+            .build()
+
+        client.newCall(request).await().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("WebDAV PROPFIND failed: HTTP ${response.code}")
+            }
+            response.body.byteStream().use { input ->
+                parseDirectories(path, input)
+                    .filter { directory ->
+                        val parent = directory.path.substringBeforeLast('/').ifBlank { "/" }
+                        directory.path != normalizePath(path) && parent == normalizePath(path)
+                    }
+            }
+        }
+    }
+
+    override suspend fun uploadFile(
+        remoteDirectory: String,
+        file: UniFile,
+        fileName: String,
+        overwrite: Boolean,
+        onProgress: (Int) -> Unit,
+    ): Boolean = withIOContext {
+        val existing = lookupUploadDestination(remoteDirectory, fileName)
+        if (existing != null && !overwrite) return@withIOContext false
+        // Chapter and metadata uploads can share a directory even across storage instances.
+        val directory = directoryLock.withLock { ensureDirectory(remoteDirectory) }
+        if (existing != null) deleteRemoteFile(directory, fileName, existing.etag)
+        val mediaType = if (fileName.endsWith(".cbz", ignoreCase = true)) CBZ_MEDIA_TYPE else GENERIC_BINARY_MEDIA_TYPE
+        val uploaded = putNewFile(directory, fileName, file, mediaType, onProgress)
+        if (!uploaded && overwrite) error("The remote file changed during upload: $fileName")
+        if (uploaded) onProgress(100)
+        uploaded
+    }
+
+    private suspend fun lookupUploadDestination(directory: String, fileName: String): UploadDestination? {
+        val url = config.resolveUrl(directory, fileName)
+        // A depth-zero DAV stat can refresh the server's directory cache before a conditional upload.
+        val stat = Request.Builder()
+            .url(url)
+            .headers(config.authHeaders())
+            .header("Depth", "0")
+            .cacheControl(CacheControl.FORCE_NETWORK)
+            .method("PROPFIND", PROPFIND_UPLOAD_DESTINATION_BODY)
+            .build()
+        client.newCall(stat).await().use { response ->
+            when (response.code) {
+                404, 410 -> return null
+                207 -> {
+                    val document = response.body.byteStream().use(::parseDavDocument)
+                    val resources = document.getElementsByTagNameNS(DAV_NAMESPACE, "response")
+                    for (index in 0 until resources.length) {
+                        val resource = resources.item(index) as Element
+                        val href = resource.firstTextByTagName("href", DAV_NAMESPACE) ?: continue
+                        val resolved = url.resolve(href) ?: continue
+                        if (resolved.pathSegments.dropLastWhile(String::isEmpty) != url.pathSegments) continue
+                        val status = resource.httpStatus()
+                        if (status == 404 || status == 410) return null
+                        if (status != null && status !in 200..299) throw IOException("WebDAV PROPFIND failed: HTTP $status")
+                        check(resource.getElementsByTagNameNS(DAV_NAMESPACE, "collection").length == 0) {
+                            "The WebDAV upload destination is a directory"
+                        }
+                        return UploadDestination(resource.firstTextByTagName("getetag", DAV_NAMESPACE))
+                    }
+                }
+                400, 403, 405, 501 -> Unit // Some servers only support HEAD for individual objects.
+                else -> throw CloudStorageHttpException(
+                    response.code,
+                    "WebDAV PROPFIND failed: HTTP ${response.code}",
+                    response.header("Retry-After")?.toLongOrNull(),
+                )
+            }
+        }
+        val request = Request.Builder()
+            .url(url)
+            .headers(config.authHeaders())
+            .cacheControl(CacheControl.FORCE_NETWORK)
+            .head()
+            .build()
+        client.newCall(request).await().use { response ->
+            if (response.code == 404 || response.code == 410) return null
+            if (response.code != 200) {
+                throw CloudStorageHttpException(
+                    response.code,
+                    "WebDAV HEAD failed: HTTP ${response.code}",
+                    response.header("Retry-After")?.toLongOrNull(),
+                )
+            }
+            check(!response.request.url.encodedPath.endsWith('/')) {
+                "The WebDAV upload destination did not resolve to the requested file"
+            }
+            return UploadDestination(response.header("ETag")?.takeIf { response.request.url == url })
+        }
+    }
+
+    private data class UploadDestination(val etag: String?)
+
+    override suspend fun downloadCbz(
+        remoteDirectory: String,
+        fileName: String,
+        file: UniFile,
+    ): Boolean = withIOContext {
+        val request = Request.Builder()
+            .url(config.resolveUrl(remoteDirectory, fileName))
+            .headers(config.authHeaders())
+            .cacheControl(CacheControl.FORCE_NETWORK)
+            .get()
+            .build()
+        client.newCall(request).await().use { response ->
+            if (response.code == 404) return@withIOContext false
+            check(response.code == 200) { "WebDAV download failed: HTTP ${response.code}" }
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            file.openOutputStream().use { output ->
+                val input = response.body.byteStream()
+                while (true) {
+                    ensureActive()
+                    val read = input.read(buffer)
+                    if (read == -1) break
+                    output.write(buffer, 0, read)
+                }
+            }
+            true
+        }
+    }
+
+    override suspend fun remoteFileSize(
+        remoteDirectory: String,
+        fileName: String,
+    ): Long? = headFileSize(remoteDirectory, fileName, allowUnavailable = true)?.takeIf { it > 0 }
+
+    override suspend fun lookupRemoteFileSize(remoteDirectory: String, fileName: String): Long? =
+        headFileSize(remoteDirectory, fileName, allowUnavailable = false)
+
+    private suspend fun headFileSize(
+        remoteDirectory: String,
+        fileName: String,
+        allowUnavailable: Boolean,
+    ): Long? = withIOContext {
+        val request = Request.Builder()
+            .url(config.resolveUrl(normalizePath(remoteDirectory), fileName))
+            .headers(config.authHeaders())
+            .header("Accept-Encoding", "identity")
+            .cacheControl(CacheControl.FORCE_NETWORK)
+            .head()
+            .build()
+        client.newCall(request).await().use { response ->
+            if (response.code == 404 || (!allowUnavailable && response.code == 410)) return@use null
+            if (response.code != 200) {
+                if (allowUnavailable && response.code in setOf(403, 405, 501)) return@use null
+                throw IOException("WebDAV HEAD failed: HTTP ${response.code}")
+            }
+            if (!allowUnavailable && response.request.url.pathSegments.last().isEmpty()) return@use null
+            val size = response.header("Content-Length")?.toLongOrNull()?.takeIf { it >= 0 }
+            if (size == null && !allowUnavailable) throw IOException("WebDAV HEAD did not return a file size")
+            size
+        }
+    }
+
+    /**
+     * Lists the requested direct children. A null result means directory listing is unavailable,
+     * and a null size means an individual file needs a HEAD request.
+     */
+    override suspend fun listRemoteFileSizes(
+        remoteDirectory: String,
+        fileNames: Set<String>,
+    ): Map<String, Long?>? = withIOContext {
+        val directory = config.resolveUrl(remoteDirectory, trailingSlash = true)
+        val request = Request.Builder()
+            .url(directory)
+            .headers(config.authHeaders())
+            .header("Depth", "1")
+            .cacheControl(CacheControl.FORCE_NETWORK)
+            .method("PROPFIND", PROPFIND_FILE_SIZES_BODY)
+            .build()
+        client.newCall(request).await().use { response ->
+            when (response.code) {
+                207 -> try {
+                    response.body.byteStream().use { parseFileSizes(directory, fileNames, it) }
+                        ?: throw IOException("Invalid WebDAV directory listing")
+                } catch (error: SAXException) {
+                    throw IOException("Invalid WebDAV directory listing", error)
+                }
+                404 -> emptyMap()
+                403, 405, 501 -> null
+                else -> throw IOException("WebDAV PROPFIND failed: HTTP ${response.code}")
+            }
+        }
+    }
+
+    private fun parseFileSizes(directory: HttpUrl, fileNames: Set<String>, input: InputStream): Map<String, Long?>? {
+        val multistatus = parseDavDocument(input).documentElement
+        if (multistatus.namespaceURI != DAV_NAMESPACE || multistatus.localName != "multistatus") return null
+        val directorySegments = directory.pathSegments.dropLast(1)
+        val resources = multistatus.getElementsByTagNameNS(DAV_NAMESPACE, "response")
+        return buildMap {
+            for (index in 0 until resources.length) {
+                val resource = resources.item(index) as Element
+                val href = resource.firstTextByTagName("href", DAV_NAMESPACE) ?: continue
+                val url = directory.resolve(href) ?: continue
+                if (url.scheme != directory.scheme || url.host != directory.host || url.port != directory.port) continue
+                val segments = url.pathSegments
+                val resourceSegments = if (segments.last().isEmpty()) segments.dropLast(1) else segments
+                if (resourceSegments == directorySegments) {
+                    val status = resource.httpStatus()
+                    if (status == 404 || status == 410) return emptyMap()
+                    if (status != null && status !in 200..299) {
+                        throw IOException("WebDAV PROPFIND failed: HTTP $status")
+                    }
+                    continue
+                }
+                if (segments.dropLast(1) != directorySegments) continue
+                val fileName = segments.last()
+                if (fileName !in fileNames) continue
+                val status = resource.httpStatus()
+                if (status == 404 || status == 410) continue
+                if (status != null && status !in 200..299) {
+                    put(fileName, null)
+                    continue
+                }
+
+                var isCollection = false
+                var size: Long? = null
+                val results = resource.getElementsByTagNameNS(DAV_NAMESPACE, "propstat")
+                for (resultIndex in 0 until results.length) {
+                    val result = results.item(resultIndex) as Element
+                    if (result.httpStatus() != 200) continue
+                    val properties = result.getElementsByTagNameNS(DAV_NAMESPACE, "prop").item(0) as? Element
+                        ?: continue
+                    isCollection =
+                        isCollection || properties.getElementsByTagNameNS(DAV_NAMESPACE, "collection").length > 0
+                    properties.firstTextByTagName("getcontentlength", DAV_NAMESPACE)?.toLongOrNull()
+                        ?.takeIf { it >= 0 }?.let { size = it }
+                }
+                if (!isCollection) put(fileName, size)
+            }
+        }
+    }
+
+    private fun Element.httpStatus(): Int? {
+        val statuses = getElementsByTagNameNS(DAV_NAMESPACE, "status")
+        for (index in 0 until statuses.length) {
+            val status = statuses.item(index)
+            if (status.parentNode == this) {
+                return status.textContent.trim().split(' ', limit = 3).getOrNull(1)?.toIntOrNull()
+            }
+        }
+        return null
+    }
+
+    private suspend fun deleteRemoteFile(
+        remoteDirectory: String,
+        fileName: String,
+        etag: String?,
+    ) = withIOContext {
+        val effectiveRemoteDirectory = normalizePath(remoteDirectory)
+        val request = Request.Builder()
+            .url(config.resolveUrl(effectiveRemoteDirectory, fileName))
+            .headers(config.authHeaders())
+            .apply { etag?.let { header("If-Match", it) } }
+            .delete()
+            .build()
+
+        client.newCall(request).await().use { response ->
+            if (response.code == 404) return@withIOContext
+            if (response.code !in SUCCESS_CODES) {
+                throw IllegalStateException("WebDAV delete failed: HTTP ${response.code}")
+            }
+        }
+    }
+
+    override suspend fun deleteMangaCollection(directory: String) = withIOContext {
+        val request = Request.Builder()
+            .url(config.resolveUrl(directory, trailingSlash = true))
+            .headers(config.authHeaders())
+            .header("Depth", "infinity")
+            .delete()
+            .build()
+        uploadClient.newCall(request).await().use { response ->
+            if (response.code !in setOf(200, 204, 404)) {
+                error("WebDAV collection delete failed: HTTP ${response.code}")
+            }
+        }
+    }
+
+    private suspend fun putNewFile(
+        remoteDirectory: String,
+        fileName: String,
+        file: UniFile,
+        mediaType: MediaType,
+        onProgress: (Int) -> Unit,
+    ): Boolean {
+        onProgress(0)
+        val request = Request.Builder()
+            .url(config.resolveUrl(remoteDirectory, fileName))
+            .headers(config.authHeaders())
+            .header("If-None-Match", "*")
+            .put(UniFileRequestBody(file, mediaType, onProgress))
+            .build()
+
+        uploadClient.newCall(request).await().use { response ->
+            if (response.code == 412) return false
+            if (response.code !in SUCCESS_CODES) {
+                throw CloudStorageHttpException(
+                    response.code,
+                    "WebDAV upload failed: HTTP ${response.code}",
+                    response.header("Retry-After")?.toLongOrNull(),
+                )
+            }
+        }
+        return true
+    }
+
+    private suspend fun ensureDirectory(path: String): String {
+        var currentPath = ""
+        normalizePath(path)
+            .trim('/')
+            .split('/')
+            .filter { it.isNotBlank() }
+            .forEach { segment ->
+                val targetPath = normalizePath("$currentPath/$segment")
+                when (val result = mkcol(targetPath)) {
+                    is MkcolResult.Success -> currentPath = targetPath
+                    is MkcolResult.Failure -> {
+                        if (directoryExists(targetPath)) {
+                            currentPath = targetPath
+                        } else {
+                            throw CloudStorageHttpException(
+                                result.code,
+                                "WebDAV MKCOL failed: HTTP ${result.code} for ${result.path}",
+                                result.retryAfterSeconds,
+                            ).apply {
+                                result.message?.let { addSuppressed(IllegalStateException(it)) }
+                            }
+                        }
+                    }
+                }
+            }
+        return currentPath.ifBlank { "/" }
+    }
+
+    private suspend fun directoryExists(path: String): Boolean {
+        val request = Request.Builder()
+            .url(config.resolveUrl(path, trailingSlash = true))
+            .headers(config.authHeaders())
+            .header("Depth", "0")
+            .method("PROPFIND", PROPFIND_BODY)
+            .build()
+
+        client.newCall(request).await().use { response ->
+            return when {
+                response.isSuccessful -> true
+                response.code == 404 -> false
+                else -> throw CloudStorageHttpException(
+                    response.code,
+                    "WebDAV PROPFIND failed: HTTP ${response.code}",
+                    response.header("Retry-After")?.toLongOrNull(),
+                )
+            }
+        }
+    }
+
+    private suspend fun mkcol(path: String): MkcolResult {
+        val request = Request.Builder()
+            .url(config.resolveUrl(path, trailingSlash = true))
+            .headers(config.authHeaders())
+            .method("MKCOL", EMPTY_BODY)
+            .build()
+
+        client.newCall(request).await().use { response ->
+            return when {
+                response.code in MKCOL_SUCCESS_CODES -> MkcolResult.Success
+                response.code in AUTH_FAILURE_CODES -> throw IllegalStateException(
+                    "WebDAV MKCOL failed: HTTP ${response.code}",
+                )
+                else -> MkcolResult.Failure(
+                    path = path,
+                    code = response.code,
+                    message = response.body.string().takeIf { it.isNotBlank() },
+                    retryAfterSeconds = response.header("Retry-After")?.toLongOrNull(),
+                )
+            }
+        }
+    }
+
+    private fun parseDirectories(
+        directory: String,
+        input: InputStream,
+    ): List<CloudSyncDirectory> {
+        val document = parseDavDocument(input)
+        val responses = document.getElementsByTagNameNS("*", "response")
+        return (0 until responses.length)
+            .asSequence()
+            .mapNotNull { index ->
+                val node = responses.item(index)
+                val element = node as? Element ?: return@mapNotNull null
+                val href = element.firstTextByTagName("href") ?: return@mapNotNull null
+                val isCollection = element.getElementsByTagNameNS("*", "collection").length > 0
+                if (!isCollection) return@mapNotNull null
+
+                val path = config.relativePathFromHref(href, directory) ?: return@mapNotNull null
+                val name = element.firstTextByTagName("displayname")
+                    ?.takeUnless { it.isBlank() }
+                    ?: path.trim('/').substringAfterLast('/', missingDelimiterValue = "/")
+                CloudSyncDirectory(
+                    name = if (path == "/") "/" else name,
+                    path = path,
+                )
+            }
+            .toList()
+            .distinctBy { it.path }
+            .sortedWith(compareBy({ it.path != "/" }, { it.name.lowercase() }))
+    }
+
+    private fun parseDavDocument(input: InputStream) = DocumentBuilderFactory.newInstance()
+        .apply { isNamespaceAware = true }
+        .newDocumentBuilder()
+        .apply { setEntityResolver { _, _ -> throw SAXException("External entities are unsupported") } }
+        .parse(input)
+
+    private fun Element.firstTextByTagName(localName: String, namespace: String = "*"): String? {
+        return getElementsByTagNameNS(namespace, localName)
+            .item(0)
+            ?.textContent
+            ?.trim()
+    }
+
+    private fun WebDavConfig.authHeaders(): Headers {
+        return Headers.Builder()
+            .add("Authorization", Credentials.basic(username, password))
+            .build()
+    }
+
+    private fun WebDavConfig.resolveUrl(
+        remotePath: String,
+        fileName: String? = null,
+        trailingSlash: Boolean = false,
+    ): HttpUrl {
+        val base = url.toHttpUrl()
+        val segments = buildList {
+            addAll(base.pathSegments.filter { it.isNotBlank() })
+            addAll(normalizePath(remotePath).trim('/').split('/').filter { it.isNotBlank() })
+            if (!fileName.isNullOrBlank()) {
+                add(fileName)
+            }
+        }
+        return base.newBuilder()
+            .encodedPath("/")
+            .apply {
+                segments.forEach(::addPathSegment)
+                if (trailingSlash) addPathSegment("")
+            }
+            .build()
+    }
+
+    private fun WebDavConfig.relativePathFromHref(href: String, directory: String): String? {
+        val base = url.toHttpUrl().pathSegments.filter { it.isNotBlank() }
+        val hrefUrl = resolveUrl(directory, trailingSlash = true).resolve(href) ?: return null
+        val segments = hrefUrl.pathSegments.filter { it.isNotBlank() }
+        if (segments.take(base.size) != base) return null
+        return normalizePath(segments.drop(base.size).joinToString("/"))
+    }
+
+    private class UniFileRequestBody(
+        private val file: UniFile,
+        private val mediaType: MediaType,
+        private val onProgress: (Int) -> Unit,
+    ) : RequestBody() {
+        private var resolvedContentLength = Long.MIN_VALUE
+
+        override fun contentType(): MediaType = mediaType
+
+        override fun contentLength(): Long {
+            if (resolvedContentLength != Long.MIN_VALUE) {
+                return resolvedContentLength
+            }
+
+            resolvedContentLength = file.length().takeIf { it >= 0 } ?: file.openInputStream().source().use { source ->
+                var total = 0L
+                val buffer = Buffer()
+                while (true) {
+                    val read = source.read(buffer, SEGMENT_SIZE)
+                    if (read == -1L) break
+                    total += read
+                    buffer.clear()
+                }
+                total
+            }
+
+            return resolvedContentLength
+        }
+
+        override fun writeTo(sink: BufferedSink) {
+            val total = contentLength()
+            var uploaded = 0L
+            val buffer = Buffer()
+
+            file.openInputStream().source().use { source ->
+                while (true) {
+                    val read = source.read(buffer, SEGMENT_SIZE)
+                    if (read == -1L) break
+                    sink.write(buffer, read)
+                    uploaded += read
+                    if (total > 0) {
+                        onProgress((uploaded * 100 / total).toInt().coerceAtMost(99))
+                    }
+                }
+            }
+        }
+    }
+
+    companion object {
+        private const val DAV_NAMESPACE = "DAV:"
+        private val PROPFIND_UPLOAD_DESTINATION_BODY =
+            """<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getetag/></d:prop></d:propfind>"""
+                .toRequestBody("application/xml; charset=utf-8".toMediaType())
+        private val PROPFIND_BODY = """
+            <?xml version="1.0" encoding="utf-8" ?>
+            <d:propfind xmlns:d="DAV:">
+              <d:prop>
+                <d:displayname />
+                <d:resourcetype />
+              </d:prop>
+            </d:propfind>
+        """.trimIndent().toRequestBody("application/xml; charset=utf-8".toMediaType())
+        private val PROPFIND_FILE_SIZES_BODY = """
+            <?xml version="1.0" encoding="utf-8" ?>
+            <d:propfind xmlns:d="DAV:">
+              <d:prop>
+                <d:getcontentlength />
+                <d:resourcetype />
+              </d:prop>
+            </d:propfind>
+        """.trimIndent().toRequestBody("application/xml; charset=utf-8".toMediaType())
+        private val EMPTY_BODY = ByteArray(0).toRequestBody(null)
+        private val CBZ_MEDIA_TYPE = "application/vnd.comicbook+zip".toMediaType()
+        private val GENERIC_BINARY_MEDIA_TYPE = "application/octet-stream".toMediaType()
+        private val SUCCESS_CODES = setOf(200, 201, 204)
+        private val MKCOL_SUCCESS_CODES = setOf(200, 201, 204, 405)
+        private val AUTH_FAILURE_CODES = setOf(401, 407)
+        private const val SEGMENT_SIZE = 8L * 1024L
+    }
+}
+
+private sealed class MkcolResult {
+    data object Success : MkcolResult()
+
+    data class Failure(
+        val path: String,
+        val code: Int,
+        val message: String?,
+        val retryAfterSeconds: Long?,
+    ) : MkcolResult()
+}

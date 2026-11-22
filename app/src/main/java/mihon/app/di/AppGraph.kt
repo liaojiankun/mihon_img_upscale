@@ -20,9 +20,12 @@ import eu.kanade.tachiyomi.data.backup.create.BackupCreateWorker
 import eu.kanade.tachiyomi.data.backup.restore.BackupRestoreWorker
 import eu.kanade.tachiyomi.data.cache.ChapterCache
 import eu.kanade.tachiyomi.data.cache.CoverCache
+import eu.kanade.tachiyomi.data.download.CloudUploadScheduler
+import eu.kanade.tachiyomi.data.download.CloudUploadWorker
 import eu.kanade.tachiyomi.data.download.DownloadCache
 import eu.kanade.tachiyomi.data.download.DownloadManager
 import eu.kanade.tachiyomi.data.download.DownloadWorker
+import eu.kanade.tachiyomi.data.download.LibraryCloudSync
 import eu.kanade.tachiyomi.data.library.LibraryUpdateWorker
 import eu.kanade.tachiyomi.data.library.MetadataUpdateWorker
 import eu.kanade.tachiyomi.data.notification.NotificationReceiver
@@ -45,6 +48,7 @@ import kotlinx.serialization.protobuf.ProtoBuf
 import mihon.core.metro.IsDebugBuild
 import mihon.domain.extension.interactor.GetExtensionStoreCountAsFlow
 import mihon.domain.extension.repository.ExtensionStoreRepository
+import mihon.domain.source.interactor.UpdateMangaFromRemote
 import nl.adaptivity.xmlutil.serialization.XML
 import tachiyomi.domain.backup.service.BackupPreferences
 import tachiyomi.domain.category.interactor.GetCategories
@@ -52,6 +56,7 @@ import tachiyomi.domain.category.interactor.ResetCategoryFlags
 import tachiyomi.domain.download.service.DownloadPreferences
 import tachiyomi.domain.library.service.LibraryPreferences
 import tachiyomi.domain.manga.interactor.GetFavorites
+import tachiyomi.domain.manga.interactor.GetManga
 import tachiyomi.domain.manga.interactor.ResetViewerFlags
 import tachiyomi.domain.source.service.SourceManager
 import tachiyomi.domain.storage.service.StoragePreferences
@@ -62,6 +67,12 @@ import tachiyomi.domain.track.interactor.UpsertTrack
     bindingContainers = [AppBindings::class],
 )
 interface AppGraph : ViewModelGraph {
+    @Provides
+    fun provideCloudUploadScheduler(context: Context): CloudUploadScheduler =
+        CloudUploadScheduler { wifiOnly, replaceWaitingWork ->
+            CloudUploadWorker.schedule(context, wifiOnly, replaceWaitingWork)
+        }
+
     fun inject(app: App)
     fun inject(mainActivity: MainActivity)
     fun inject(readerActivity: ReaderActivity)
@@ -97,7 +108,9 @@ interface AppGraph : ViewModelGraph {
     val crashLogUtil: CrashLogUtil
 
     val cloudSyncService: eu.kanade.tachiyomi.data.download.CloudSyncService
+    val oneDriveAuth: eu.kanade.tachiyomi.data.download.OneDriveAuth
     val downloadManager: DownloadManager
+    val libraryCloudSync: LibraryCloudSync
 
     val updateChecker: AppUpdateChecker
 
@@ -118,6 +131,8 @@ interface AppGraph : ViewModelGraph {
     val javaScriptEngine: JavaScriptEngine
 
     val getFavorites: GetFavorites
+    val getManga: GetManga
+    val updateMangaFromRemote: UpdateMangaFromRemote
     val getCategories: GetCategories
     val resetViewerFlags: ResetViewerFlags
     val resetCategoryFlags: ResetCategoryFlags

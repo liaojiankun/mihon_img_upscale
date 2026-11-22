@@ -12,6 +12,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.security.MessageDigest
 import java.util.Properties
+import java.util.UUID
 
 plugins {
     alias(mihonx.plugins.android.application)
@@ -168,12 +169,21 @@ android {
     defaultConfig {
         applicationId = "app.mihon.upscale"
 
-        versionCode = 48
-        versionName = "1.3.17"
+        versionCode = 55
+        versionName = "1.3.23"
         buildConfigField("int", "UPSTREAM_VERSION_CODE", "38")
 
         buildConfigField("boolean", "TELEMETRY_INCLUDED", "${Config.includeTelemetry}")
         buildConfigField("boolean", "UPDATER_ENABLED", "${Config.enableUpdater}")
+        val oneDriveClientId = providers.gradleProperty("oneDriveClientId")
+            .orElse(providers.environmentVariable("ONEDRIVE_CLIENT_ID"))
+            .getOrElse("")
+            .trim()
+            .ifEmpty { "2a99b21a-48c3-4b19-b0ef-ea42da100884" }
+        require(runCatching {
+            UUID.fromString(oneDriveClientId).toString().equals(oneDriveClientId, ignoreCase = true)
+        }.getOrDefault(false)) { "oneDriveClientId must be a Microsoft Entra application (client) ID" }
+        buildConfigField("String", "ONEDRIVE_CLIENT_ID", "\"$oneDriveClientId\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
